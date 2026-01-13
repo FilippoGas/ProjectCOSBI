@@ -1,0 +1,349 @@
+---
+title: "Natri_et_al"
+author: "Filippo Gastaldello"
+date: "2025-12-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(Seurat)
+library(jsonlite)
+```
+
+# Load data, remove cells with undesired diagnoses and only keep count layer of RNA assay, save 
+```{r}
+data <- readRDS("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/Natri_et_al.rds")
+data_bkp <- data
+# Remove cells from diagnoses other than "Control" or "IPF"
+data <- subset(data, subset = c(Diagnosis == "Control" | Diagnosis == "IPF"))
+```
+
+# QC
+
+## Check QC violin plots
+```{r}
+# Add metadata column to group cells together
+data[['group']] <- "all_cells"
+VlnPlot(data,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        ncol = 3,
+        group.by = "group",
+        alpha = 0.1)
+```
+## QC Scatter plots
+
+```{r}
+FeatureScatter(data, feature1 = "nCount_RNA", feature2 = "percent.mt", group.by = "group")
+FeatureScatter(data, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "group")
+```
+## Filter cells based on QC, also keep unfiltered dataset
+```{r}
+# Number of distinc feature has already been filtered to be at least 1000 by the authors.
+data_qc <- subset(data,
+                  subset =      nFeature_RNA < 4500 &
+                                percent.mt < 7 &
+                                percent.mt > 0.2 &
+                                nCount_RNA < 30000
+                  )
+
+# Also save a downsampled version to run SPECTRA faster
+data_downsampled_2000 <- subset(data,
+                          subset = nFeature_RNA < 3000 &
+                                   percent.mt < 3 &
+                                   percent.mt > 2.95 &
+                                   nCount_RNA < 9000
+                          )
+data_downsampled_4000 <- subset(data,
+                          subset = nFeature_RNA < 3000 &
+                                   percent.mt < 3 &
+                                   percent.mt > 2.9 &
+                                   nCount_RNA < 9000
+                          )
+```
+
+## Replot QC after filtering
+```{r}
+VlnPlot(data_qc,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        ncol = 3,
+        group.by = "group",
+        alpha = 0.1)
+FeatureScatter(data_qc, feature1 = "nCount_RNA", feature2 = "percent.mt", group.by = "group")
+FeatureScatter(data_qc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "group")
+```
+
+# LOG NORMALIZATION
+
+```{r}
+data <- NormalizeData(data, normalization.method = "LogNormalize", scale.factor = 10000)
+data_qc <- NormalizeData(data_qc, normalization.method = "LogNormalize", scale.factor = 10000)
+data_downsampled_2000 <- NormalizeData(data_downsampled_2000, normalization.method = "LogNormalize", scale.factor = 10000)
+data_downsampled_4000 <- NormalizeData(data_downsampled_4000, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+# ADD ANNOTATIONS FROM CYTOPUS AND NICOLA
+
+The next steps assumes that conversion dictionaries have been created.
+```{r}
+# Load conversion dictionaries
+
+cytopus_dict <- read_json("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cell_type_conversion_dictionaries/Natri_et_al_conversion_dict_manual_annotation_to_cytopus.json")
+cytopus_dict <- data.frame("manual_annotation_1"=names(cytopus_dict),
+                           "cytopus"=unname(unlist(cytopus_dict))
+                           )
+nicola_dict <- read_json("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cell_type_conversion_dictionaries/Natri_et_al_conversion_dict_manual_annotation_to_Nicola.json")
+nicola_dict <- data.frame("manual_annotation_1"=names(nicola_dict),
+                           "nicola_annotation"=unname(unlist(nicola_dict))
+                          )
+
+# Add annotations to metadata in all datasets
+data@meta.data <- data@meta.data %>% 
+                        rownames_to_column("barcode") %>%
+                        left_join(cytopus_dict, by = "manual_annotation_1") %>%
+                        left_join(nicola_dict, by = "manual_annotation_1") %>% 
+                        column_to_rownames("barcode")
+
+data_qc@meta.data <- data_qc@meta.data %>% 
+                        rownames_to_column("barcode") %>%
+                        left_join(cytopus_dict, by = "manual_annotation_1") %>%
+                        left_join(nicola_dict, by = "manual_annotation_1") %>% 
+                        column_to_rownames("barcode")
+
+data_downsampled_2000@meta.data <- data_downsampled_2000@meta.data %>%
+                        rownames_to_column("barcode") %>%
+                        left_join(cytopus_dict, by = "manual_annotation_1") %>%
+                        left_join(nicola_dict, by = "manual_annotation_1") %>% 
+                        column_to_rownames("barcode")
+data_downsampled_4000@meta.data <- data_downsampled_4000@meta.data %>%
+                        rownames_to_column("barcode") %>%
+                        left_join(cytopus_dict, by = "manual_annotation_1") %>%
+                        left_join(nicola_dict, by = "manual_annotation_1") %>% 
+                        column_to_rownames("barcode")
+```
+
+# ANNOTATE WITH ACCORDION (Busarello et al.)
+```{r}
+library(cellmarkeraccordion)
+
+# Load accordion's database for marker genes
+data(accordion_marker)
+
+# Find clusters
+data <- FindNeighbors(data, dims = 1:10)
+data <- FindClusters(data, resolution = 0.4)
+
+data_qc <- FindNeighbors(data_qc, dims = 1:10)
+data_qc <- FindClusters(data_qc, resolution = 0.4)
+
+# Perform annotation
+data <- accordion(data, assay = "RNA", species = "Human", tissue = "lung", annotation_resolution = "cluster", max_n_marker = 30, combined_score_quantile_threshold = 0.75)
+data_qc <- accordion(data_qc, assay = "RNA", species = "Human", tissue = "lung", annotation_resolution = "cluster", max_n_marker = 30, combined_score_quantile_threshold = 0.75)
+```
+# PLOT ANNOTATIONS OVER UMAP
+```{r}
+DimPlot(data, group.by = "manual_annotation_1")
+DimPlot(data, group.by = "annotation_level_1")
+DimPlot(data, group.by = "annotation_level_2")
+DimPlot(data, group.by = "cytopus")
+DimPlot(data, group.by = "nicola_annotation")
+DimPlot(data, group.by = "accordion_per_cluster")
+```
+
+
+# GET CELL TYPES IN DATASET
+```{r}
+# Full dataset
+ann_cell_types_full <- unique(bind_cols(data$manual_annotation_1, data$annotation_level_1, data$annotation_level_2, data$nicola_annotation, data$cytopus))
+colnames(ann_cell_types_full) <- c("manual_annotation", "annotation_level1", "annotation_level2", "nicola_annotation", "cytopus")
+write_csv(ann_cell_types_full, file = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cell_type_lists/Natri_et_al_annotated_cell_types_full.csv", col_names = TRUE)
+
+# Full dataset
+ann_cell_types_qc <- unique(bind_cols(data_qc$manual_annotation_1, data_qc$annotation_level_1, data_qc$annotation_level_2, data_qc$nicola_annotation, data_qc$cytopus))
+colnames(ann_cell_types_qc) <- c("manual_annotation", "annotation_level1", "annotation_level2", "nicola_annotation", "cytopus")
+write_csv(ann_cell_types_qc, file = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cell_type_lists/Natri_et_al_annotated_cell_types_qc.csv", col_names = TRUE)
+
+# Downsampled dataset
+ann_cell_types_downsampled <- unique(bind_cols(data_downsampled_2000$manual_annotation_1, data_downsampled_2000$annotation_level_1, data_downsampled_2000$annotation_level_2, data_downsampled_2000$nicola_annotation, data_downsampled_2000$cytopus))
+colnames(ann_cell_types_downsampled) <- c("manual_annotation", "annotation_level1", "annotation_level2", "nicola_annotation", "cytopus")
+write_csv(ann_cell_types_downsampled, file = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cell_type_lists/Natri_et_al_annotated_cell_types_downsampled_2000.csv", col_names = TRUE)
+
+ann_cell_types_downsampled <- unique(bind_cols(data_downsampled_4000$manual_annotation_1, data_downsampled_4000$annotation_level_1, data_downsampled_4000$annotation_level_2, data_downsampled_4000$nicola_annotation, data_downsampled_4000$cytopus))
+colnames(ann_cell_types_downsampled) <- c("manual_annotation", "annotation_level1", "annotation_level2", "nicola_annotation", "cytopus")
+write_csv(ann_cell_types_downsampled, file = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cell_type_lists/Natri_et_al_annotated_cell_types_downsampled_4000.csv", col_names = TRUE)
+```
+# PLOT CELL COUNT BY CELL TYPE, CASE VS CONTROL
+
+## Dataset preparation
+```{r}
+cell_type_count <- data@meta.data %>%   dplyr::select(Diagnosis, manual_annotation_1) %>% 
+                                        summarize(n(), .by = c('Diagnosis', 'manual_annotation_1'))
+cell_type_count <- cell_type_count %>% left_join(data@meta.data %>% dplyr::select(manual_annotation_1, annotation_level_2, nicola_annotation) %>% unique())
+colnames(cell_type_count) <- c('Diagnosis','manual_annotation_1', 'cell_count', 'general_annotation', 'nicola_annotation')
+
+cell_type_count <- cell_type_count %>% left_join(cytopus_dict, by = "manual_annotation_1")
+
+# QC
+
+cell_type_count_qc <- data_qc@meta.data %>%   dplyr::select(Diagnosis, manual_annotation_1) %>% 
+                                        summarize(n(), .by = c('Diagnosis', 'manual_annotation_1'))
+cell_type_count_qc <- cell_type_count_qc %>% left_join(data_qc@meta.data %>% dplyr::select(manual_annotation_1, annotation_level_2, nicola_annotation) %>% unique())
+colnames(cell_type_count_qc) <- c('Diagnosis','manual_annotation_1', 'cell_count', 'general_annotation', 'nicola_annotation')
+
+cell_type_count_qc <- cell_type_count_qc %>% left_join(cytopus_dict, by = "manual_annotation_1")
+
+```
+
+## Annotation level 2
+
+```{r, fig.height = 8, fig.width=20}
+# NO QC
+
+p <- cell_type_count %>% ggplot(aes(x = manual_annotation_1, y = cell_count, fill = Diagnosis)) +
+                        geom_bar(position = 'dodge', stat = 'identity') +
+                        facet_grid(. ~ general_annotation,
+                                   scales = "free_x",
+                                   space = "free_x") +
+                        theme_classic() +
+                        theme(
+                                axis.text.x = element_text(angle = 45, hjust = 1, size = 8), # Rotate x labels
+                                strip.background = element_blank(), # Remove box around "Endothelial", etc.
+                                strip.text = element_text(angle = 70, hjust = 1, vjust = 1, size = 6, face = "bold"), # Style the group labels
+                                panel.spacing = unit(1, "lines") # Adjust gap size between groups
+                                ) +
+                        scale_fill_manual(values = c("Control" = "#1b9e77", "IPF" = "#7570b3"))
+p
+ggsave(plot = p, filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cell_type_count_plots/no_QC/count_per_celltype_AnnoLevel2.pdf", create.dir = TRUE)
+
+# QC
+p <- cell_type_count_qc %>% ggplot(aes(x = manual_annotation_1, y = cell_count, fill = Diagnosis)) +
+                        geom_bar(position = 'dodge', stat = 'identity') +
+                        facet_grid(. ~ general_annotation,
+                                   scales = "free_x",
+                                   space = "free_x") +
+                        theme_classic() +
+                        theme(
+                                axis.text.x = element_text(angle = 45, hjust = 1, size = 8), # Rotate x labels
+                                strip.background = element_blank(), # Remove box around "Endothelial", etc.
+                                strip.text = element_text(angle = 70, hjust = 1, vjust = 1, size = 6, face = "bold"), # Style the group labels
+                                panel.spacing = unit(1, "lines"), # Adjust gap size between groups
+                                plot.margin = margin(t=20)) +
+                        scale_fill_manual(values = c("Control" = "#1b9e77", "IPF" = "#7570b3"))
+p
+ggsave(plot = p, filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cell_type_count_plots/QC/count_per_celltype_AnnoLevel2.pdf", create.dir = TRUE)
+```
+
+
+## Annotation cytopus
+
+```{r, fig.height = 8, fig.width=20}
+# NO QC
+
+p <- cell_type_count %>% ggplot(aes(x = manual_annotation_1, y = cell_count, fill = Diagnosis)) +
+                        geom_bar(position = 'dodge', stat = 'identity') +
+                        facet_grid(. ~ cytopus,
+                                   scales = "free_x",
+                                   space = "free_x") +
+                        theme_classic() +
+                        theme(
+                                axis.text.x = element_text(angle = 45, hjust = 1, size = 8), # Rotate x labels
+                                strip.background = element_blank(), # Remove box around "Endothelial", etc.
+                                strip.text = element_text(angle = 90, hjust = 0, size = 6, face = "bold"), # Style the group labels
+                                panel.spacing = unit(2, "lines") # Adjust gap size between groups
+                                ) +
+                        scale_fill_manual(values = c("Control" = "#1b9e77", "IPF" = "#7570b3"))
+p
+ggsave(plot = p, filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cell_type_count_plots/no_QC/count_per_celltype_AnnoCytopus.pdf", create.dir = TRUE)
+
+# QC
+
+p <- cell_type_count_qc %>% ggplot(aes(x = manual_annotation_1, y = cell_count, fill = Diagnosis)) +
+                        geom_bar(position = 'dodge', stat = 'identity') +
+                        facet_grid(. ~ cytopus,
+                                   scales = "free_x",
+                                   space = "free_x") +
+                        theme_classic() +
+                        theme(
+                                axis.text.x = element_text(angle = 45, hjust = 1, size = 8), # Rotate x labels
+                                strip.background = element_blank(), # Remove box around "Endothelial", etc.
+                                strip.text = element_text(angle = 90, hjust = 0, size = 6, face = "bold"), # Style the group labels
+                                panel.spacing = unit(2, "lines") # Adjust gap size between groups
+                                ) +
+                        scale_fill_manual(values = c("Control" = "#1b9e77", "IPF" = "#7570b3"))
+p
+ggsave(plot = p, filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cell_type_count_plots/QC/count_per_celltype_AnnoCytopus.pdf", create.dir = TRUE)
+```
+
+## Annotation Nicola
+```{r, fig.height = 8, fig.width=20}
+
+# NO QC
+p <- cell_type_count %>% ggplot(aes(x = manual_annotation_1, y = cell_count, fill = Diagnosis)) +
+                        geom_bar(position = 'dodge', stat = 'identity') +
+                        facet_grid(. ~ nicola_annotation,
+                                   scales = "free_x",
+                                   space = "free_x") +
+                        theme_classic() +
+                        theme(
+                                axis.text.x = element_text(angle = 45, hjust = 1, size = 8), # Rotate x labels
+                                strip.background = element_blank(), # Remove box around "Endothelial", etc.
+                                strip.text = element_text(angle = 45, hjust = 1, size = 6, face = "bold"), # Style the group labels
+                                panel.spacing = unit(2, "lines"), # Adjust gap size between groups
+                                plot.margin = margin(t=20)) +
+                        scale_fill_manual(values = c("Control" = "#1b9e77", "IPF" = "#7570b3"))
+p
+
+ggsave(plot = p, filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cell_type_count_plots/no_QC/count_per_celltype_AnnoNicola.pdf", create.dir = TRUE)
+
+# QC
+
+p <- cell_type_count_qc %>% ggplot(aes(x = manual_annotation_1, y = cell_count, fill = Diagnosis)) +
+                        geom_bar(position = 'dodge', stat = 'identity') +
+                        facet_grid(. ~ nicola_annotation,
+                                   scales = "free_x",
+                                   space = "free_x") +
+                        theme_classic() +
+                        theme(
+                                axis.text.x = element_text(angle = 45, hjust = 1, size = 8), # Rotate x labels
+                                strip.background = element_blank(), # Remove box around "Endothelial", etc.
+                                strip.text = element_text(angle = 45, hjust = 1, size = 6, face = "bold"), # Style the group labels
+                                panel.spacing = unit(2, "lines"), # Adjust gap size between groups
+                                plot.margin = margin(t=20)) +
+                        scale_fill_manual(values = c("Control" = "#1b9e77", "IPF" = "#7570b3"))
+p
+
+ggsave(plot = p, filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cell_type_count_plots/QC/count_per_celltype_AnnoNicola.pdf", create.dir = TRUE)
+```
+
+# CONVERT TO H5AD
+
+```{r}
+library(SeuratDisk)
+
+# no QC
+DefaultAssay(data) <- "RNA"
+data <- DietSeurat(data, assays = "RNA", layers = "data", dimreducs = NULL, graphs = NULL)
+SaveH5Seurat(data, filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/AnnData/Natri_et_al_no_QC_ACCORDION.h5Seurat", overwrite = TRUE)
+Convert("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/AnnData/Natri_et_al_no_QC_ACCORDION.h5Seurat", dest = "h5ad", overwrite = TRUE)
+
+# QC
+DefaultAssay(data_qc) <- "RNA"
+data_qc <- DietSeurat(data_qc, assays = "RNA", layers = "data", dimreducs = NULL, graph = NULL)
+SaveH5Seurat(data_qc, filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/AnnData/Natri_et_al_QC_ACCORDION.h5Seurat", overwrite = TRUE)
+Convert("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/AnnData/Natri_et_al_QC_ACCORDION.h5Seurat", dest = "h5ad", overwrite = TRUE)
+
+# DOWNSAMPLING
+DefaultAssay(data_downsampled_2000) <- "RNA"
+data_downsampled_2000 <- DietSeurat(data_downsampled_2000, assays = "RNA", layers = "data", dimreducs = NULL, graph = NULL)
+SaveH5Seurat(data_downsampled_2000, filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/AnnData/Natri_et_al_downsampled_2000_ACCORDION.h5Seurat", overwrite = TRUE)
+Convert("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/AnnData/Natri_et_al_downsampled_2000_ACCORDION.h5Seurat", dest = "h5ad", overwrite = TRUE)
+
+DefaultAssay(data_downsampled_4000) <- "RNA"
+data_downsampled_4000 <- DietSeurat(data_downsampled_4000, assays = "RNA", layers = "data", dimreducs = NULL, graph = NULL)
+SaveH5Seurat(data_downsampled_4000, filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/AnnData/Natri_et_al_downsampled_4000_ACCORDION.h5Seurat", overwrite = TRUE)
+Convert("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/AnnData/Natri_et_al_downsampled_4000_ACCORDION.h5Seurat", dest = "h5ad", overwrite = TRUE)
+```
+
