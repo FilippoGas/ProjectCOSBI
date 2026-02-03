@@ -1,0 +1,441 @@
+Filippo Gastaldello - 26/01/26
+
+Analysis of the output of SPECTRA
+
+```{r}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+library(ggpubr)
+library(ggrepel)
+```
+
+# Data loading and preprocess
+```{r}
+# Cell scores quantify the activation of each gene program in every cell
+cell_scores <- read_csv("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/cytopus_annotation/Natri_et_al_full_cytopus_anno_cell_scores_15098.hpc3-head1.unitn.it.csv") %>% rename("cell_id"="...1")
+# Expression metadata are needed to match cell id to their cell type
+metadata <- read_csv("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/Natri_et_al_metadata.csv")
+# Only keep metadata for cells in the SPECTRA output
+metadata <- metadata %>% filter(cell_id %in% cell_scores$cell_id)
+# Add condition column to cell scores
+cell_scores <- cell_scores %>% 
+                        left_join(metadata %>% select(cell_id, Diagnosis, Sample_Name, Phase, cytopus)) %>%
+                        relocate(Diagnosis, .before = cell_id) %>%
+                        relocate(Phase, .after = Diagnosis) %>%
+                        relocate(Sample_Name, .before = Diagnosis) %>% 
+                        relocate(cytopus, .after=Diagnosis)
+# Remove programs without a name
+unknown_programs <- grep("\\d+$", colnames(cell_scores)[6:length(colnames(cell_scores))], value = TRUE)
+cell_scores <- cell_scores %>% select(-c(unknown_programs))
+```
+# Upnaired Welch's test
+
+Test IGP activation differences in case vs control, for each cell type
+
+```{r}
+res_welch <- lapply(unique(cell_scores$cytopus),
+                function(cell_type){
+                        # Subset cell scores to keep only current cell type
+                        celltype_cell_score <- cell_scores %>% filter(cytopus == cell_type)
+                        # Prepare dataset to store Welch's test results
+                        tests <- data_frame("cell_type"=character(), "program"=character(), "active_cells_control_perc"=numeric(), "active_cells_case_perc"=numeric(), "t-statistic"=numeric(),
+                                            "df"=numeric(), "p"=numeric(), "control_avg"=numeric(), "case_avg"=numeric())
+                        # For each program, test for difference in activation between case and control, only in active cells (activation > 0.001) as per Authors suggestion
+                        for (program in colnames(celltype_cell_score)[6:length(colnames(celltype_cell_score))]) {
+                                # Compute number of active cells (activation > 0.001) in this cell type
+                                perc_active_cells_control <- round((celltype_cell_score %>%
+                                                                        filter(Diagnosis == "Control" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                perc_active_cells_case <-    round((celltype_cell_score %>%
+                                                                        filter(Diagnosis == "IPF" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                # Try to compute the test, it might fail if not enough cells are active
+                                test_res <- try(t.test(x = (celltype_cell_score %>% filter(Diagnosis == "Control" & .[[program]]>0.001) %>% select(all_of(program))),
+                                                       y = (celltype_cell_score %>% filter(Diagnosis == "IPF" & .[[program]]>0.001) %>% select(all_of(program))),
+                                                       var.equal = FALSE),
+                                                       silent = TRUE)
+                                if (inherits(test_res, "try-error")) {
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, "active_cells_control_perc"=perc_active_cells_control,
+                                                                  "active_cells_case_perc"=perc_active_cells_case, "t-statistic"=NA, "df"=NA,
+                                                                  "p"=NA, "control_avg"=NA, "case_avg"=NA)
+                                                       )
+                                }else{
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, "active_cells_control_perc"=perc_active_cells_control,
+                                                                  "active_cells_case_perc"=perc_active_cells_case, "t-statistic"=test_res$statistic, "df"=test_res$parameter,
+                                                                  "p"=test_res$p.value, "control_avg"=test_res$estimate[1], "case_avg"=test_res$estimate[2])
+                                                       )
+                                }
+                        }
+                        return(tests)
+                }
+        )
+IGP_activation_welch <- bind_rows(res_welch)
+
+# Compute FDR to account for multiple testing
+IGP_activation_welch <- IGP_activation_welch %>%
+                                drop_na() %>% 
+                                group_by(cell_type) %>% 
+                                mutate(FDR = p.adjust(p, method = "fdr")) %>% 
+                                ungroup() %>% 
+        relocate(FDR, .after = p)
+
+# Compute two measure of effect size
+#
+# logFC <- log(case_avg/control_avg)
+# delta_active <- active_cells_case_perc - active_cells_control_perc
+IGP_activation_welch <- IGP_activation_welch %>% mutate(delta_active = active_cells_case_perc - active_cells_control_perc,
+                                                        logFC = log2(case_avg/control_avg))
+
+write_csv(IGP_activation_welch, file = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/IPG_activation_welch_test.csv")
+```
+
+## Boxplots - facet
+
+Plot activation values in case vs control, only in comparisons where the difference is significant according to the Welch test
+
+```{r}
+# Extract significant tests
+welch_sig <- IGP_activation_welch %>% filter(FDR <0.05 & (abs(logFC) > 1 | abs(delta_active) > 20))
+# Flatten cell_scores for plotting
+plot_data <- cell_scores %>% pivot_longer(6:length(colnames(cell_scores)), names_to = "program")
+# Only keep data points representing active cells ( activation > 0.001) belonging to significant comparisons
+plot_data <- plot_data %>% inner_join(welch_sig %>% select(cell_type, program), by = join_by("cytopus"=="cell_type", "program"=="program")) %>% rename("cell_type"="cytopus") %>% filter(value>0.001)
+
+p <- plot_data %>% ggplot(aes(x=program, y=value, fill=Diagnosis))+
+                geom_boxplot()+
+                theme(
+                        axis.text.x = element_text(hjust=1, angle = 45, size = 5)
+                )+
+                facet_wrap(~cell_type, scale="free")
+p
+ggsave(filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/welch_test/boxplots/boxplot_welch_significant_facet_celltype.pdf", plot = p, device = "pdf", width = 18, height = 15, create.dir = TRUE)
+```
+
+## Boxplots - per celltype
+
+Plot activation values in case vs control, only in comparisons where the difference is significant according to the Welch test
+
+```{r}
+for (celltype in unique(metadata$cytopus)) {
+        
+        p <- plot_data %>% filter(cell_type==celltype) %>% ggplot(aes(x=program, y=value, fill=Diagnosis))+
+                                                                geom_boxplot()+
+                                                                labs(
+                                                                        title = paste0("IGP with significant differences in activation between case and control in ",celltype," cells."),
+                                                                        y = "Activation level"
+                                                                )+
+                                                                theme(
+                                                                        axis.text.x = element_text(hjust=1, angle=45, size=8)
+                                                                )+
+                                                                stat_compare_means(
+                                                                        aes(group = Diagnosis),
+                                                                        method = "t.test",
+                                                                        method.args = list(var.equal=FALSE),
+                                                                        vjust = -1
+                                                                )+
+                                                                stat_summary(
+                                                                    fun.data = function(y) {
+                                                                      return(data.frame(
+                                                                        y = max(y),  # Position: slightly above the max value of that group
+                                                                        label = paste0("n= ",length(y)) # Label: the count of points
+                                                                      ))
+                                                                    },
+                                                                    geom = "text",
+                                                                    position = position_dodge(width = 0.75), # Must match your boxplot width (default is 0.75)
+                                                                    vjust = -0.5,             # Adjust vertical spacing
+                                                                    size = 3                  # Font size
+                                                                  )
+                                                                                        
+        
+        ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/welch_test/boxplots/boxplot_welch_significant_", celltype,".pdf"), plot = p, device = "pdf", width = 12, height = 8, create.dir = TRUE)
+}
+```
+## Volcano plot
+```{r}
+# create tag for labels and deregulation column
+FC_thresh <- 1
+FDR_thresh <- 0.05
+
+plot_data <- IGP_activation_welch %>% 
+                mutate(tag = paste0(cell_type, "-", str_split_i(program, "-X-",3)),
+                       diff_activated = ifelse(FDR<FDR_thresh & logFC>FC_thresh, "UP", "NO"),
+                       diff_activated = ifelse(FDR<FDR_thresh & logFC< -FC_thresh, "DOWN", diff_activated))
+
+p <- plot_data %>% ggplot(aes(x=logFC, y=-log10(FDR), color = diff_activated)) +
+                geom_point(size = 1) +
+                scale_color_manual(values = c("red", "grey", "purple"),
+                                   labels = c("Downactivated", "Not significant", "Overactivated")) +
+                geom_vline(xintercept = c(-1, 1), col = 'grey', linetype = 'dashed') +
+                geom_hline(yintercept = -log10(0.05), col = 'grey', linetype = 'dashed') +
+                labs(
+                        title = "Welch's t-test",
+                        subtitle = "comparison between activation in case vs control, for each program in each cell type",
+                        x = "log2(activation FC)"
+                        ) +
+                geom_label_repel(
+                        data = plot_data %>% filter((FDR<FDR_thresh & logFC>FC_thresh) | (FDR<FDR_thresh & logFC< -FC_thresh)),
+                        aes(label = tag),
+                        size = 2.5,           
+                        max.overlaps = Inf,   
+                        box.padding = 0.5,
+                        point.padding = 0.2,
+                        min.segment.length = 0,
+                        nudge_x = .15,
+                        nudge_y = .5,) +
+                theme_minimal()
+p
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/welch_test/volcano_welch.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+```
+
+# Linear Mixed Model
+
+In Welch's test each cell is seen as an inpdendent measurement, ingoring the possible collinearity of cells belonging to the same patient. Linear Mixed Models correct for this modeling the patient id as a random effect.
+
+```{r message=FALSE, warning=FALSE}
+res_lmm <- lapply(unique(metadata$cytopus),
+                function(cell_type){
+                        # Subset cell scores to keep only current cell type
+                        celltype_cell_score <- cell_scores %>% filter(cytopus == cell_type)
+                        # Prepare dataset to store Welch's test results
+                        tests <- data_frame("cell_type"=character(), "program"=character(), "term"=character(), "active_cells_control_perc"=numeric(), "active_cells_case_perc"=numeric(), "avg_control_activation"=numeric(), "avg_case_activation"= numeric(), "estimate"=numeric(),
+                                            "std.err"=numeric(), "statistic"=numeric(), "p"=numeric())
+                        # For each program, test for difference in activation between case and control, only in active cells (activation > 0.001) as per Authors suggestion
+                        for (program in colnames(celltype_cell_score)[6:length(colnames(celltype_cell_score))]) {
+                                # Compute number of active cells (activation > 0.001) in this cell type
+                                perc_active_cells_control <- round((celltype_cell_score %>%
+                                                                        filter(Diagnosis == "Control" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                perc_active_cells_case <-    round((celltype_cell_score %>%
+                                                                        filter(Diagnosis == "IPF" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                # Compute average activation in case vs control
+                                avg_control_activation <- celltype_cell_score %>%
+                                                                filter(Diagnosis == "Control") %>% 
+                                                                pull(any_of(program)) %>% 
+                                                                mean()
+                                avg_case_activation <- celltype_cell_score %>%
+                                                                filter(Diagnosis == "IPF") %>% 
+                                                                pull(any_of(program)) %>% 
+                                                                mean()
+                                # Try to compute the test, it might fail if not enough cells are active
+                                data <- celltype_cell_score %>% select(Diagnosis, Sample_Name, all_of(program)) %>% filter(.[[program]]>0.001)
+                                colnames(data) <- c("Diagnosis", "Sample_Name", "Program")
+                                test_res <- try(lmer(Program ~ Diagnosis + (1|Sample_Name), data = data),
+                                                silent = TRUE)
+                                if (inherits(test_res, "try-error")) {
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, term = NA, "active_cells_control_perc"=perc_active_cells_control,
+                                                                  "active_cells_case_perc"=perc_active_cells_case, "avg_control_activation"=avg_control_activation,
+                                                                  "avg_case_activation"=avg_case_activation, "estimate"=NA, "std.err"=NA,"statistic"=NA, "p"=NA)
+                                                       )
+                                }else{
+                                        test_res <- tidy(test_res, effects = "fixed")[2,]
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, "term"=test_res$term,
+                                                                  "active_cells_control_perc"=perc_active_cells_control, "active_cells_case_perc"=perc_active_cells_case,
+                                                                  "avg_control_activation"=avg_control_activation,"avg_case_activation"=avg_case_activation,
+                                                                  "estimate"=test_res$estimate, "std.err"=test_res$std.error, "statistic"=test_res$statistic, "p"=test_res$p.value)
+                                                       )
+                                }
+                        }
+                        return(tests)
+                }
+        )
+IGP_activation_lmm <- bind_rows(res_lmm)
+IGP_activation_lmm <- IGP_activation_lmm %>% 
+                        drop_na() %>% 
+                        group_by(cell_type) %>% 
+                        mutate(FDR = p.adjust(p, method = "fdr")) %>% 
+                        ungroup()
+# Compute effect size as activationFC log2((avg_control_activation + estimate)/avg_case_activation)
+IGP_activation_lmm <- IGP_activation_lmm %>% mutate(logFC = log2((avg_control_activation+estimate)/avg_control_activation))
+
+write_csv(IGP_activation_lmm, file = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/IPG_activation_lmm.csv")
+```
+
+## Volcano plot
+```{r}
+# create tag for labels and deregulation column
+FC_thresh <- 1
+FDR_thresh <- 0.05
+
+plot_data <- IGP_activation_lmm %>%
+                filter(!logFC=="NaN" ) %>% 
+                mutate(tag = paste0(cell_type, "-", str_split_i(program, "-X-",3)),
+                       diff_activated = ifelse(FDR<FDR_thresh & logFC>FC_thresh, "UP", "NO"),
+                       diff_activated = ifelse(FDR<FDR_thresh & logFC< -FC_thresh, "DOWN", diff_activated))
+
+p <- plot_data %>% ggplot(aes(x=logFC, y=-log10(FDR), color = diff_activated)) +
+                geom_point(size = 1) +
+                scale_color_manual(values = c("red", "grey", "purple"),
+                                   labels = c("Downactivated", "Not significant", "Overactivated")) +
+                geom_vline(xintercept = c(-1, 1), col = 'grey', linetype = 'dashed') +
+                geom_hline(yintercept = -log10(0.05), col = 'grey', linetype = 'dashed') +
+                labs(
+                        title = "Linear Mixed Model - Sample ID as random effect",
+                        subtitle = "comparison between activation in case vs control, for each program in each cell type",
+                        x = "log2(activation FC)"
+                        ) +
+                geom_label_repel(
+                        data = plot_data %>% filter((FDR<FDR_thresh & logFC>FC_thresh) | (FDR<FDR_thresh & logFC< -FC_thresh)),
+                        aes(label = tag),
+                        size = 2.5,           
+                        max.overlaps = Inf,   
+                        box.padding = 0.5,
+                        point.padding = 0.2,
+                        min.segment.length = 0,
+                        nudge_x = .15,
+                        nudge_y = .5,) +
+                theme_minimal()
+p
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/lmm/volcano_lmm.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+```
+
+
+# Linear Mixed Model - cell cycle phase correction
+
+```{r message=FALSE, warning=FALSE}
+res_lmm <- lapply(unique(metadata$cytopus),
+                function(cell_type){
+                        # Subset cell scores to keep only current cell type
+                        celltype_cell_score <- cell_scores %>% filter(cytopus == cell_type)
+                        # Prepare dataset to store Welch's test results
+                        tests <- data_frame("cell_type"=character(), "program"=character(), "term"=character(), "active_cells_control_perc"=numeric(), "active_cells_case_perc"=numeric(), "avg_control_activation"=numeric(), "avg_case_activation"= numeric(), "estimate"=numeric(),
+                                            "std.err"=numeric(), "statistic"=numeric(), "p"=numeric())
+                        # For each program, test for difference in activation between case and control, only in active cells (activation > 0.001) as per Authors suggestion
+                        for (program in colnames(celltype_cell_score)[6:length(colnames(celltype_cell_score))]) {
+                                # Compute number of active cells (activation > 0.001) in this cell type
+                                perc_active_cells_control <- round((celltype_cell_score %>%
+                                                                        filter(Diagnosis == "Control" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                perc_active_cells_case <-    round((celltype_cell_score %>%
+                                                                        filter(Diagnosis == "IPF" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                # Compute average activation in case vs control
+                                avg_control_activation <- celltype_cell_score %>%
+                                                                filter(Diagnosis == "Control") %>% 
+                                                                pull(any_of(program)) %>% 
+                                                                mean()
+                                avg_case_activation <- celltype_cell_score %>%
+                                                                filter(Diagnosis == "IPF") %>% 
+                                                                pull(any_of(program)) %>% 
+                                                                mean()
+                                # Try to compute the test, it might fail if not enough cells are active
+                                data <- celltype_cell_score %>% select(Diagnosis, Sample_Name, Phase, all_of(program)) %>% filter(.[[program]]>0.001)
+                                colnames(data) <- c("Diagnosis", "Sample_Name", "Phase", "Program")
+                                test_res <- try(lmer(Program ~ Diagnosis + Phase + (1|Sample_Name), data = data),
+                                                silent = TRUE)
+                                if (inherits(test_res, "try-error")) {
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, term = NA, "active_cells_control_perc"=perc_active_cells_control,
+                                                                  "active_cells_case_perc"=perc_active_cells_case, "average_control_activation"=avg_control_activation,
+                                                                  "avg_case_activation"=avg_case_activation, "estimate"=NA, "std.err"=NA, "statistic"=NA, "p"=NA)
+                                                       )
+                                }else{
+                                        test_res <- tidy(test_res, effects = "fixed")[2:3,]
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, "term"=test_res$term,
+                                                                  "active_cells_control_perc"=perc_active_cells_control, "active_cells_case_perc"=perc_active_cells_case,
+                                                                  "average_control_activation"=avg_control_activation, "avg_case_activation"=avg_case_activation,
+                                                                  "estimate"=test_res$estimate, "std.err"=test_res$std.error, "statistic"=test_res$statistic, "p"=test_res$p.value)
+                                                       )
+                                }
+                        }
+                        return(tests)
+                }
+        )
+IGP_activation_lmm_phase_corrected <- bind_rows(res_lmm)
+IGP_activation_lmm_phase_corrected <- IGP_activation_lmm_phase_corrected %>% 
+                        drop_na() %>% 
+                        group_by(cell_type) %>% 
+                        mutate(FDR = p.adjust(p, method = "fdr")) %>% 
+                        ungroup()
+# Compute effect size as activationFC log2((avg_control_activation + estimate)/avg_case_activation)
+IGP_activation_lmm_phase_corrected <- IGP_activation_lmm_phase_corrected %>% mutate(logFC = log2((avg_control_activation+estimate)/avg_control_activation))
+
+write_csv(IGP_activation_lmm_phase_corrected, file = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/IPG_activation_lmm_phase_corrected.csv")
+```
+
+## Volcano plot
+```{r}
+# create tag for labels and deregulation column
+FC_thresh <- 1
+FDR_thresh <- 0.05
+
+plot_data <- IGP_activation_lmm_phase_corrected %>%
+                filter(!logFC=="NaN",
+                       !str_detect(term, "Phase")) %>% 
+                mutate(tag = paste0(cell_type, "-", str_split_i(program, "-X-",3)),
+                       diff_activated = ifelse(FDR<FDR_thresh & logFC>FC_thresh, "UP", "NO"),
+                       diff_activated = ifelse(FDR<FDR_thresh & logFC< -FC_thresh, "DOWN", diff_activated))
+
+p <- plot_data %>% ggplot(aes(x=logFC, y=-log10(FDR), color = diff_activated)) +
+                geom_point(size = 1) +
+                scale_color_manual(values = c("red", "grey", "purple"),
+                                   labels = c("Downactivated", "Not significant", "Overactivated")) +
+                geom_vline(xintercept = c(-1, 1), col = 'grey', linetype = 'dashed') +
+                geom_hline(yintercept = -log10(0.05), col = 'grey', linetype = 'dashed') +
+                labs(
+                        title = "Linear Mixed Model - Sample ID as random effect, correcting for cell cycle phase",
+                        subtitle = "comparison between activation in case vs control, for each program in each cell type",
+                        x = "log2(activation FC)"
+                        ) +
+                geom_label_repel(
+                        data = plot_data %>% filter((FDR<FDR_thresh & logFC>FC_thresh) | (FDR<FDR_thresh & logFC< -FC_thresh)),
+                        aes(label = tag),
+                        size = 2.5,           
+                        max.overlaps = Inf,   
+                        box.padding = 0.5,
+                        point.padding = 0.2,
+                        min.segment.length = 0,
+                        nudge_x = .15,
+                        nudge_y = .5,) +
+                theme_minimal()
+p
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/lmm/volcano_lmm_phase_corrected.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
