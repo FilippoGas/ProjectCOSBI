@@ -33,7 +33,7 @@ metadata <- data@meta.data %>%
 # Filter SPECTRA output to only contain cell in metadata
 cell_scores <- cell_scores %>% filter(cell_id %in% rownames(metadata))
 # For each patient save celltype resolution table of cell scores
-lapply(unique(metadata$Sample_Name), function(current_name){
+res <- lapply(unique(metadata$Sample_Name), function(current_name){
         # Get cells for current patient
         patient_cell_scores <- cell_scores %>% filter(cell_id %in% (metadata %>% filter(Sample_Name == current_name) %>% rownames()))
         # group cells by celltype
@@ -46,7 +46,17 @@ lapply(unique(metadata$Sample_Name), function(current_name){
                                                         summarise_at(colnames(patient_cell_scores)[-1], mean) %>% 
                                                         rename("cell_type"="cytopus")
         write_csv(patient_cell_scores, file = paste0(output_folder, "patients_cell_scores/",current_name, ".csv"))
+        
+        return(data_frame("count" = 1, "composition" = paste(sort(patient_cell_scores$cell_type), collapse = "&")))
+        
 })
+# Check cell type composition for each patient
+celltype_comp <- bind_rows(res)
+celltype_comp <- celltype_comp %>% 
+                        group_by(composition) %>% 
+                        summarize(sum(count)) %>% 
+                        mutate(celltype_count = str_count(composition, "&"))
+
 # Save patient status
 patient_status <- metadata %>% select(Sample_Name, Diagnosis) %>% unique()
 write_csv(patient_status, file = paste0(output_folder, "patients_status.csv"))
