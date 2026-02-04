@@ -66,6 +66,8 @@ data_downsampled_4000 <- subset(data,
                           )
 data_downsample_4_patients <- subset(data,
                                      subset = Sample_Name %in% c("THD0005", "THD0005", "TILD037", "TILD037"))
+data_lung_epi <- subset(data,
+                        subset = cytopus %in% c("lung-epi"))
 ```
 
 ## Replot QC after filtering
@@ -358,5 +360,10 @@ DefaultAssay(data_downsample_4_patients) <- "RNA"
 data_downsample_4_patients <- DietSeurat(data_downsample_4_patients, assays = "RNA", layers = "data", dimreducs = NULL, graph = NULL)
 SaveH5Seurat(data_downsample_4_patients, filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/AnnData/Natri_et_al_downsampled_4patients.h5Seurat", overwrite = TRUE)
 Convert("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/AnnData/Natri_et_al_downsampled_4patients.h5Seurat", dest = "h5ad", overwrite = TRUE)
+
+DefaultAssay(data_lung_epi) <- "RNA"
+data_lung_epi <- DietSeurat(data_lung_epi, assays = "RNA", layers = "data", dimreducs = NULL, graphs = NULL)
+SaveH5Seurat(data_lung_epi, filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/AnnData/Natri_et_al_downsampled_lung-epi.h5Seurat", overwrite = TRUE)
+Convert("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/AnnData/Natri_et_al_downsampled_lung-epi.h5Seurat", dest = "h5ad", overwrite = TRUE)
 ```
 
