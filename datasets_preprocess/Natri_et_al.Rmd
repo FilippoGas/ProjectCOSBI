@@ -81,15 +81,7 @@ FeatureScatter(data_qc, feature1 = "nCount_RNA", feature2 = "percent.mt", group.
 FeatureScatter(data_qc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "group")
 ```
 
-# LOG NORMALIZATION
 
-```{r}
-data <- NormalizeData(data, normalization.method = "LogNormalize", scale.factor = 10000)
-data_qc <- NormalizeData(data_qc, normalization.method = "LogNormalize", scale.factor = 10000)
-data_downsampled_2000 <- NormalizeData(data_downsampled_2000, normalization.method = "LogNormalize", scale.factor = 10000)
-data_downsampled_4000 <- NormalizeData(data_downsampled_4000, normalization.method = "LogNormalize", scale.factor = 10000)
-data_downsample_4_patients <- NormalizeData(data_downsample_4_patients, normalization.method = "LogNormalize", scale.factor = 10000)
-```
 # ADD ANNOTATIONS FROM CYTOPUS AND NICOLA
 
 The next steps assumes that conversion dictionaries have been created.
@@ -134,6 +126,14 @@ data_downsample_4_patients@meta.data <- data_downsample_4_patients@meta.data %>%
                         left_join(nicola_dict, by = "manual_annotation_1") %>% 
                         column_to_rownames("barcode")
 ```
+
+# Mixed annotation
+Create a column with cytopus annotations for all cells, substitute lung-epi with the manual annotation
+```{r}
+data@meta.data <- data@meta.data %>% 
+                        mutate(mixed_annotation = ifelse(cytopus=="lung-epi", manual_annotation_1, cytopus))
+```
+
 
 # ANNOTATE WITH ACCORDION (Busarello et al.)
 ```{r}
