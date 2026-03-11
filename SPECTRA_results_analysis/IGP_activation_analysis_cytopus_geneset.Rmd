@@ -1,0 +1,1423 @@
+Filippo Gastaldello - 26/01/26
+
+Analysis of the output of SPECTRA
+
+```{r}
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+library(ggpubr)
+library(ggrepel)
+library(parallel)
+library(Seurat)
+library(eulerr)
+library(patchwork)
+library(ggplotify)
+library(jsonlite)
+library(tidyverse)
+library(ggrastr)
+library(msigdbr)
+library(fgsea)
+library(clusterProfiler)  
+library(org.Hs.eg.db)
+library(DOSE)
+library(ReactomePA)
+library(enrichplot)
+```
+
+# Data loading and preprocess
+```{r}
+# Define cell type annotation and gene sets to be used
+annotation <- "manual"
+annotation_column <- "manual_annotation_1"
+
+# Cell scores quantify the activation of each gene program in every cell
+cell_scores <- read_csv("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/manual_annotation/Natri_et_al_full_manual_anno_cell_scores_93908.hpc3-head1.unitn.it.csv") %>% dplyr::rename("cell_id"="...1")
+# Expression metadata are needed to match cell id to their cell type
+metadata <- read_csv("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/Natri_et_al_metadata.csv")
+# Only keep metadata for cells in the SPECTRA output
+metadata <- metadata %>% filter(cell_id %in% cell_scores$cell_id)
+# Add condition column to cell scores
+cell_scores <- cell_scores %>% 
+                        left_join(metadata %>% dplyr::select(cell_id, Diagnosis, Sample_Name, Phase, annotation_column)) %>%
+                        relocate(Diagnosis, .before = cell_id) %>%
+                        relocate(Phase, .after = Diagnosis) %>%
+                        relocate(Sample_Name, .before = Diagnosis) %>% 
+                        relocate(annotation_column, .after=Diagnosis)
+colnames(cell_scores)[3] <- "annotation"
+# Remove programs without a name
+unknown_programs <- grep("\\d+$", colnames(cell_scores)[6:length(colnames(cell_scores))], value = TRUE)
+cell_scores <- cell_scores %>% dplyr::select(-all_of(unknown_programs))
+```
+# Upnaired Welch's test (DAP)
+
+Test IGP activation differences in case vs control, for each cell type
+
+```{r}
+res_welch <- lapply(unique(cell_scores$annotation),
+                function(cell_type){
+                        # Subset cell scores to keep only current cell type
+                        celltype_cell_score <- cell_scores %>% filter(annotation == cell_type)
+                        # Prepare dataset to store Welch's test results
+                        tests <- data_frame("cell_type"=character(), "program"=character(), "active_cells_control_perc"=numeric(), "active_cells_case_perc"=numeric(), "t-statistic"=numeric(),
+                                            "df"=numeric(), "p"=numeric(), "control_avg"=numeric(), "case_avg"=numeric())
+                        # For each program, test for difference in activation between case and control, only in active cells (activation > 0.001) as per Authors suggestion
+                        for (program in colnames(celltype_cell_score)[6:length(colnames(celltype_cell_score))]) {
+                                # Compute number of active cells (activation > 0.001) in this cell type
+                                perc_active_cells_control <- round((celltype_cell_score %>%
+                                                                        filter(Diagnosis == "Control" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                perc_active_cells_case <-    round((celltype_cell_score %>%
+                                                                        filter(Diagnosis == "IPF" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                # Try to compute the test, it might fail if not enough cells are active
+                                test_res <- try(t.test(x = (celltype_cell_score %>% dplyr::filter(Diagnosis == "Control" & .[[program]]>0.001) %>% dplyr::select(all_of(program))),
+                                                       y = (celltype_cell_score %>% dplyr::filter(Diagnosis == "IPF" & .[[program]]>0.001) %>% dplyr::select(all_of(program))),
+                                                       var.equal = FALSE),
+                                                       silent = TRUE)
+                                if (inherits(test_res, "try-error")) {
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, "active_cells_control_perc"=perc_active_cells_control,
+                                                                  "active_cells_case_perc"=perc_active_cells_case, "t-statistic"=NA, "df"=NA,
+                                                                  "p"=NA, "control_avg"=NA, "case_avg"=NA)
+                                                       )
+                                }else{
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, "active_cells_control_perc"=perc_active_cells_control,
+                                                                  "active_cells_case_perc"=perc_active_cells_case, "t-statistic"=test_res$statistic, "df"=test_res$parameter,
+                                                                  "p"=test_res$p.value, "control_avg"=test_res$estimate[1], "case_avg"=test_res$estimate[2])
+                                                       )
+                                }
+                        }
+                        return(tests)
+                }
+        )
+IGP_activation_welch <- bind_rows(res_welch)
+
+# Compute FDR to account for multiple testing
+IGP_activation_welch <- IGP_activation_welch %>%
+                                drop_na() %>% 
+                                group_by(cell_type) %>% 
+                                mutate(FDR = p.adjust(p, method = "fdr")) %>% 
+                                ungroup() %>% 
+        relocate(FDR, .after = p)
+
+# Compute two measure of effect size
+#
+# logFC <- log(case_avg/control_avg)
+# delta_active <- active_cells_case_perc - active_cells_control_perc
+IGP_activation_welch <- IGP_activation_welch %>% mutate(delta_active = active_cells_case_perc - active_cells_control_perc,
+                                                        log2FC = log2(case_avg/control_avg))
+
+if(! dir.exists(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/"))){dir.create(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/"), recursive = TRUE)}
+write_csv(IGP_activation_welch, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/IPG_activation_welch_test.csv"))
+```
+
+## Boxplots - facet
+
+Plot activation values in case vs control, only in comparisons where the difference is significant according to the Welch test
+
+```{r}
+# Extract significant tests
+welch_sig <- IGP_activation_welch %>% dplyr::filter(FDR <0.05 & (abs(log2FC) > 1))
+# Flatten cell_scores for plotting
+plot_data <- cell_scores %>% pivot_longer(6:length(colnames(cell_scores)), names_to = "program")
+# Only keep data points representing active cells ( activation > 0.001) belonging to significant comparisons
+plot_data <- plot_data %>% inner_join(welch_sig %>% dplyr::select(cell_type, program), by = join_by("annotation"=="cell_type", "program"=="program")) %>% dplyr::rename("cell_type"="annotation") %>% dplyr::filter(value>0.001)
+
+p <- plot_data %>% ggplot(aes(x=program, y=value, fill=Diagnosis))+
+                geom_boxplot()+
+                theme(
+                        axis.text.x = element_text(hjust=1, angle = 45, size = 5)
+                )+
+                facet_wrap(~cell_type, scale="free")
+p
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/boxplots_DAP/boxplot_welch_significant_facet_celltype.pdf"), plot = p, device = "pdf", width = 18, height = 15, create.dir = TRUE)
+```
+## Boxplots - per celltype
+
+Plot activation values in case vs control, only in comparisons where the difference is significant according to the Welch test
+
+```{r}
+for (celltype in unique(plot_data$cell_type)) {
+        
+        p <- plot_data %>% filter(cell_type==celltype) %>% ggplot(aes(x=program, y=value, fill=Diagnosis)) +
+                                                                geom_boxplot() +
+                                                                labs(title = paste0("IGP with significant differences in activation between case and control in ",celltype," cells."),
+                                                                     y = "Activation level"
+                                                                ) +
+                                                                theme(axis.text.x = element_text(hjust=1, angle=45, size=8)) +
+                                                                stat_compare_means(
+                                                                        aes(group = Diagnosis),
+                                                                        method = "t.test",
+                                                                        method.args = list(var.equal=FALSE),
+                                                                        vjust = -1
+                                                                ) +
+                                                                stat_summary(
+                                                                    fun.data = function(y) {
+                                                                      return(data.frame(
+                                                                        y = max(y),
+                                                                        label = paste0("n= ",length(y))
+                                                                      ))
+                                                                    },
+                                                                    geom = "text",
+                                                                    position = position_dodge(width = 0.75),
+                                                                    vjust = -0.5,
+                                                                    size = 3
+                                                                  )
+                                                                                        
+        
+        ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation,"_annotation/welch_test/boxplots_DAP/boxplot_welch_significant_", gsub("/","_",celltype),".pdf"), plot = p, device = "pdf", width = 12, height = 8, create.dir = TRUE)
+}
+```
+## Volcano plot
+```{r}
+# create tag for labels and deregulation column
+FC_thresh <- 1
+FDR_thresh <- 0.05
+
+plot_data <- IGP_activation_welch %>% 
+                mutate(tag = paste0(cell_type, "-", str_split_i(program, "-X-",3)),
+                       diff_activated = ifelse(FDR<FDR_thresh & log2FC>FC_thresh, "UP", "NO"),
+                       diff_activated = ifelse(FDR<FDR_thresh & log2FC< -FC_thresh, "DOWN", diff_activated))
+
+p <- plot_data %>% ggplot(aes(x=log2FC, y=-log10(FDR), color = diff_activated)) +
+                geom_point(size = 1) +
+                scale_color_manual(values = c("red", "grey", "purple"),
+                                   labels = c("Downactivated", "Not significant", "Overactivated")) +
+                geom_vline(xintercept = c(-1, 1), col = 'grey', linetype = 'dashed') +
+                geom_hline(yintercept = -log10(0.05), col = 'grey', linetype = 'dashed') +
+                labs(
+                        title = "Welch's t-test",
+                        subtitle = "comparison between activation in case vs control, for each program in each cell type",
+                        x = "log2(activation FC)"
+                        ) +
+                geom_label_repel(
+                        data = plot_data %>% filter((FDR<FDR_thresh & log2FC>FC_thresh) | (FDR<FDR_thresh & log2FC< -FC_thresh)),
+                        aes(label = tag),
+                        size = 2.5,           
+                        max.overlaps = Inf,   
+                        box.padding = 0.5,
+                        point.padding = 0.2,
+                        min.segment.length = 0,
+                        nudge_x = .15,
+                        nudge_y = .5,) +
+                theme_minimal()
+p
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/volcano_welch_DAP.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+```
+# Unpaired Welch's test (expression)
+
+Test for differences in gene expression, per cell-type, per program
+
+```{r}
+# Load seurat object for expression data and cytopus gene sets
+data <- read_rds("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/Natri_et_al_clean.rds")
+Idents(data) <- annotation_column
+cytopus_gene_sets <- read_json("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cytopus_gene_sets/knowledgebase_gene_sets_manual_annotation.json")
+
+celltypes <- metadata %>% pull(any_of(annotation_column)) %>% unique()
+
+res_welch <- lapply(celltypes, function(cell_type){
+  
+        # Subset gene expression to keep only current cell type
+        celltype_exp <- GetAssayData(subset(data, idents = cell_type), assay = "RNA", layer = "data")
+        celltype_exp <- t(as.matrix(celltype_exp))
+        # Identify Control and IPF cells once per cell type
+        ctrl_cells <- metadata %>% dplyr::filter(Diagnosis == "Control", .[[annotation_column]] == cell_type) %>% pull(cell_id)
+        case_cells <- metadata %>% dplyr::filter(Diagnosis == "IPF", .[[annotation_column]] == cell_type) %>% pull(cell_id)
+        # Ensure we only ask for cells that exist in the matrix
+        ctrl_cells <- intersect(ctrl_cells, rownames(celltype_exp))
+        case_cells <- intersect(case_cells, rownames(celltype_exp))
+        # Extract gene_sets of current celltype
+        celltype_gene_sets <- c(cytopus_gene_sets[[cell_type]], cytopus_gene_sets[["global"]])
+        
+        program_names <- names(celltype_gene_sets)
+        
+        test_results_list <- lapply(program_names, function(prog_name) {
+        
+                # Retrieve genes involved in the program
+                program_genes <- unlist(celltype_gene_sets[[prog_name]])
+                valid_genes <- intersect(program_genes, colnames(celltype_exp))
+                
+                # Skip if no valid genes to prevent matrix subsetting errors
+                if(length(valid_genes) == 0) {
+                        return(data.frame("cell_type"=cell_type, "program"=prog_name, "t-statistic"=NA, "df"=NA, "p"=NA, "control_avg"=NA, "case_avg"=NA))
+                }
+                
+                expr_ctrl_vals <- as.vector(celltype_exp[ctrl_cells, valid_genes, drop = FALSE])
+                expr_case_vals <- as.vector(celltype_exp[case_cells, valid_genes, drop = FALSE])
+                
+                # Try to compute the test
+                test_res <- try(t.test(x = expr_ctrl_vals,
+                                       y = expr_case_vals),
+                                silent = TRUE)
+                
+                if (inherits(test_res, "try-error")) {
+                        return(data.frame("cell_type"=cell_type, "program"=prog_name, "t-statistic"=NA, "df"=NA, "p"=NA, "control_avg"=NA, "case_avg"=NA))
+                } else {
+                        return(data.frame("cell_type"=cell_type, "program"=prog_name, "t-statistic"=test_res$statistic, "df"=test_res$parameter, "p"=test_res$p.value, "control_avg"=test_res$estimate[1], "case_avg"=test_res$estimate[2]))
+                }
+        })
+        tests <- bind_rows(test_results_list)
+        return(tests)
+})
+
+IGP_expression_welch <- bind_rows(res_welch)
+
+# Compute FDR to account for multiple testing
+IGP_expression_welch <- IGP_expression_welch %>%
+                                drop_na() %>% 
+                                group_by(cell_type) %>% 
+                                mutate(FDR = p.adjust(p, method = "fdr")) %>% 
+                                ungroup() %>% 
+        relocate(FDR, .after = p)
+
+# logFC <- log(case_avg/control_avg)
+IGP_expression_welch <- IGP_expression_welch %>% mutate(log2FC = log2(case_avg/control_avg))
+
+write_csv(IGP_expression_welch, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/IPG_expression_welch_test.csv"))
+```
+
+## Boxplots - facet and per celltype
+
+Plot expression distribution for all genes belonging to each program for each cell type in case vs control, only in comparisons where the difference is significant according to the Welch test
+
+```{r}
+# Extract significant tests
+welch_sig <- IGP_expression_welch %>% filter(FDR <0.05 & (abs(log2FC) > 1))
+
+# One plot per type as well as facet
+plots <- lapply(unique(welch_sig$cell_type), function(celltype){
+        
+        # Subset gene expression to keep only current cell type
+        celltype_exp <- GetAssayData(subset(data, idents = celltype), assay = "RNA", layer = "data")
+        celltype_exp <- t(as.matrix(celltype_exp))
+        
+        # For the current celltype, extract gene expression for eachy significant program
+        plot_data <- lapply(welch_sig %>% dplyr::filter(cell_type == celltype) %>% pull(program), function(program_name){
+                
+                # Get genes involved in program (Check if program is cell specific or general)
+                if (str_split_i(program_name, "_", 1) == "all") {
+                        program_genes <- unlist(cytopus_gene_sets[["global"]][[program_name]])
+                }else{
+                        program_genes <- unlist(cytopus_gene_sets[[celltype]][[program_name]])
+                }
+                valid_genes <- intersect(program_genes, colnames(celltype_exp))
+                # Get expression for these genes, pivot and set cell_id as column
+                program_genes_exp <- celltype_exp[,valid_genes] %>% as.data.frame() %>% rownames_to_column(var = "cell_id")
+                program_genes_exp <- program_genes_exp %>% pivot_longer(cols = colnames(program_genes_exp)[-1])
+                # Add information about condition
+                program_genes_exp <- program_genes_exp %>% left_join(metadata %>% dplyr::select(cell_id, Diagnosis))
+                # Add program column
+                program_genes_exp <- program_genes_exp %>% mutate(program = program_name)
+        })
+        plot_data <- bind_rows(plot_data)
+        
+        # Plot boxplot for this celltype
+        p <- plot_data %>% ggplot(aes(x=program, y=log(value), fill=Diagnosis)) +
+                                geom_boxplot() +
+                                labs(title = paste0("IGP with significant differences in gene expression between case and control in ",celltype," cells."),
+                                     y = "log(Gene expression)"
+                                ) +
+                                theme(axis.text.x = element_text(hjust=1, angle=45, size=8)) +
+                                stat_compare_means(
+                                        aes(group = Diagnosis),
+                                        method = "t.test",
+                                        label = "p.signif",
+                                        method.args = list(var.equal=FALSE),
+                                        vjust = -1,
+                                        size = 3
+                                ) +
+                                stat_summary(
+                                    fun.data = function(y) {
+                                      return(data.frame(
+                                        y = max(y),
+                                        label = paste0("n= ",length(y))
+                                      ))
+                                    },
+                                    geom = "text",
+                                    position = position_dodge(width = 0.75),
+                                    vjust = -0.5,
+                                    size = 3
+                                  ) +
+                                theme_minimal()
+                                                                                        
+        
+        ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation,"_annotation/welch_test/boxplots_DEG/boxplot_welch_significant_", gsub("/","_",celltype),".pdf"), plot = p, device = "pdf", width = 10, height = 7, create.dir = TRUE)
+        
+        return(p)
+})
+
+combined_plot <- wrap_plots(plots)
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation ,"_annotation/welch_test/boxplots_DEG/boxplot_welch_significant_facet.pdf"), plot = combined_plot, width = 25, height = 25, create.dir = TRUE)
+```
+
+## Volcano plot
+```{r}
+# create tag for labels and deregulation column
+FC_thresh <- 1
+FDR_thresh <- 0.05
+
+plot_data <- IGP_expression_welch %>% 
+                mutate(tag = paste0(cell_type, "-", program),
+                       diff_expressed = ifelse(FDR<FDR_thresh & log2FC>FC_thresh, "UP", "NO"),
+                       diff_expressed = ifelse(FDR<FDR_thresh & log2FC< -FC_thresh, "DOWN", diff_expressed))
+
+p <- plot_data %>% ggplot(aes(x=log2FC, y=-log10(FDR), color = diff_expressed)) +
+                geom_point(size = 1) +
+                scale_color_manual(values = c("red", "grey", "purple"),
+                                   labels = c("Repressed", "Not significant", "Overexpressed")) +
+                geom_vline(xintercept = c(-1, 1), col = 'grey', linetype = 'dashed') +
+                geom_hline(yintercept = -log10(0.05), col = 'grey', linetype = 'dashed') +
+                labs(
+                        title = "Welch's t-test",
+                        subtitle = "comparison between gene expression in case vs control, for each program in each cell type",
+                        x = "log2(expression FC)"
+                        ) +
+                geom_label_repel(
+                        data = plot_data %>% filter((FDR<FDR_thresh & log2FC>FC_thresh) | (FDR<FDR_thresh & log2FC< -FC_thresh)),
+                        aes(label = tag),
+                        size = 2.5,           
+                        max.overlaps = Inf,   
+                        box.padding = 0.5,
+                        point.padding = 0.2,
+                        min.segment.length = 0,
+                        nudge_x = .15,
+                        nudge_y = .5,) +
+                theme_minimal()
+p
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/volcano_welch_DEG.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+```
+
+# Wilcoxon-Mann-Whitney test (DAP)
+
+Test IGP activation differences in case vs control, for each cell type
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+res_WMW <- lapply(unique(cell_scores$annotation), function(cell_type){
+  
+        # Subset cell scores to keep only current cell type
+        celltype_cell_score <- cell_scores %>% dplyr::filter(annotation == cell_type)
+        
+        # Store total cells for percentages
+        n_total_control <- sum(celltype_cell_score$Diagnosis == "Control")
+        n_total_ipf     <- sum(celltype_cell_score$Diagnosis == "IPF")
+        
+        # Use a list to store loop results
+        tests_list <- list()
+        
+        programs <- colnames(celltype_cell_score)[6:length(colnames(celltype_cell_score))]
+        
+        for (program in programs) {
+        
+                # Extract active cells
+                vec_control <- celltype_cell_score %>% dplyr::filter(Diagnosis == "Control" & .[[program]] > 0.001) %>% pull(all_of(program))
+                vec_ipf     <- celltype_cell_score %>% dplyr::filter(Diagnosis == "IPF" & .[[program]] > 0.001) %>% pull(all_of(program))
+                
+                n_active_control <- length(vec_control)
+                n_active_case    <- length(vec_ipf)
+                
+                perc_active_control <- round((n_active_control / n_total_control) * 100, 2)
+                perc_active_case    <- round((n_active_case / n_total_ipf) * 100, 2)
+                
+                # Try to compute the test
+                test_res <- try(wilcox.test(x = vec_control, y = vec_ipf, paired = FALSE), silent = TRUE)
+                
+                if (inherits(test_res, "try-error")) {
+                        stat <- NA
+                        pval <- NA
+                }else{
+                        stat <- test_res$statistic
+                        pval <- test_res$p.value
+                }
+                
+                # Store results, including the active sample sizes
+                tests_list[[program]] <- data.frame(
+                        cell_type = cell_type, 
+                        program = program, 
+                        active_cells_control_perc = perc_active_control,
+                        active_cells_case_perc = perc_active_case, 
+                        n_active_control = n_active_control, 
+                        n_active_case = n_active_case,       
+                        statistic = stat, 
+                        p = pval
+                )
+        }
+        return(bind_rows(tests_list))
+})
+
+# Bind all cell types together
+IGP_activation_WMW <- bind_rows(res_WMW)
+
+# Compute FDR and Effect Size
+IGP_activation_WMW <- IGP_activation_WMW %>%
+  drop_na(p) %>% 
+  group_by(cell_type) %>% 
+  mutate(FDR = p.adjust(p, method = "fdr")) %>% 
+  ungroup() %>% 
+  relocate(FDR, .after = p) %>%
+  # Apply the Rank-Biserial Formula using the sample sizes
+  mutate(effect_size = abs(1 - (2 * statistic) / (n_active_control * n_active_case)))
+
+if(! dir.exists(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/"))){dir.create(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/"), recursive = TRUE)}
+write_csv(IGP_activation_WMW, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/IPG_activation_WMW_test.csv"))
+```
+
+## Boxplots - facet
+
+Plot activation values in case vs control, only in comparisons where the difference is significant according to the Welch test
+
+```{r}
+# Extract significant tests
+WMW_sig <- IGP_activation_WMW %>% dplyr::filter(FDR <0.05 & (effect_size > 0.3))
+# Flatten cell_scores for plotting
+plot_data <- cell_scores %>% pivot_longer(6:length(colnames(cell_scores)), names_to = "program")
+# Only keep data points representing active cells ( activation > 0.001) belonging to significant comparisons
+plot_data <- plot_data %>% inner_join(WMW_sig %>% dplyr::select(cell_type, program), by = join_by("annotation"=="cell_type", "program"=="program")) %>% dplyr::rename("cell_type"="annotation") %>% dplyr::filter(value>0.001)
+
+p <- plot_data %>% ggplot(aes(x=program, y=value, fill=Diagnosis))+
+                geom_boxplot()+
+                theme(
+                        axis.text.x = element_text(hjust=1, angle = 45, size = 5)
+                )+
+                facet_wrap(~cell_type, scale="free")
+p
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/boxplots_DAP/boxplot_wilcoxon_significant_facet_celltype.pdf"), plot = p, device = "pdf", width = 18, height = 15, create.dir = TRUE)
+```
+## Boxplots - per celltype
+
+Plot activation values in case vs control, only in comparisons where the difference is significant according to the Welch test
+
+```{r}
+for (celltype in unique(plot_data$cell_type)) {
+        
+        p <- plot_data %>% dplyr::filter(cell_type==celltype) %>% ggplot(aes(x=program, y=value, fill=Diagnosis)) +
+                                                                geom_boxplot() +
+                                                                labs(title = paste0("IGP with significant differences in activation between case and control in ",celltype," cells."),
+                                                                     y = "Activation level"
+                                                                ) +
+                                                                theme(axis.text.x = element_text(hjust=1, angle=45, size=8)) +
+                                                                stat_compare_means(
+                                                                        aes(group = Diagnosis),
+                                                                        method = "t.test",
+                                                                        method.args = list(var.equal=FALSE),
+                                                                        vjust = -1
+                                                                ) +
+                                                                stat_summary(
+                                                                    fun.data = function(y) {
+                                                                      return(data.frame(
+                                                                        y = max(y),
+                                                                        label = paste0("n= ",length(y))
+                                                                      ))
+                                                                    },
+                                                                    geom = "text",
+                                                                    position = position_dodge(width = 0.75),
+                                                                    vjust = -0.5,
+                                                                    size = 3
+                                                                  )
+                                                                                        
+        
+        ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation,"_annotation/wilcoxon_test/boxplots_DAP/boxplot_wilcoxon_significant_", gsub("/", "_", celltype),".pdf"), plot = p, device = "pdf", width = 12, height = 8, create.dir = TRUE)
+}
+```
+## Scatter plot FDR vs effect size
+```{r}
+# create tag for labels and deregulation column
+effect_size_thresh_medium <- 0.3
+effect_size_thresh_high <- 0.5
+FDR_thresh <- 0.05
+
+plot_data <- IGP_activation_WMW %>% 
+                mutate(tag            = paste0(cell_type, "-", str_split_i(program, "-X-",3)),
+                       effect         = ifelse(FDR<FDR_thresh & effect_size > effect_size_thresh_medium, "Medium effect size", "Small effect size"),
+                       effect         = ifelse(FDR<FDR_thresh & effect_size > effect_size_thresh_high, "High effect size", effect),
+                       effect         = as.factor(effect))
+
+p <- plot_data %>% ggplot(aes(x=effect_size, y=-log10(FDR), color = effect)) +
+                        geom_point(size = 1) +
+                        scale_color_manual(values = c("High effect size" = "red", "Medium effect size" = "purple", "Small effect size" = "grey")) +
+                        geom_vline(xintercept = 0.3, col = 'grey', linetype = 'dashed') +
+                        geom_hline(yintercept = -log10(0.05), col = 'grey', linetype = 'dashed') +
+                        labs(
+                                title    = "Wilcoxon rank sum test",
+                                subtitle = "comparison between activation in case vs control, for each program in each cell type",
+                                x        = "Effect size") +
+                        geom_label_repel(
+                                data = plot_data %>% filter((FDR<FDR_thresh & effect_size>effect_size_thresh_high)),
+                                aes(label = tag),
+                                size = 2.5,           
+                                max.overlaps = Inf,   
+                                box.padding = 0.5,
+                                point.padding = 0.2,
+                                min.segment.length = 0,
+                                nudge_x = .15,
+                                nudge_y = .5,) +
+                        theme_minimal()
+p
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/scatterplot_wilcoxon_DAP.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+```
+# Wilcoxon-Mann-Whitney test (expression)
+
+Test for differences in gene expression, per cell-type, per program
+
+```{r}
+celltypes <- metadata %>% pull(any_of(annotation_column)) %>% unique()
+
+res_welch <- lapply(celltypes, function(cell_type){
+  
+        # Subset gene expression to keep only current cell type
+        celltype_exp <- GetAssayData(subset(data, idents = cell_type), assay = "RNA", layer = "data")
+        celltype_exp <- t(as.matrix(celltype_exp))
+        
+        # Identify Control and IPF cells once per cell type
+        ctrl_cells <- metadata %>% dplyr::filter(Diagnosis == "Control", .[[annotation_column]] == cell_type) %>% pull(cell_id)
+        case_cells <- metadata %>% dplyr::filter(Diagnosis == "IPF", .[[annotation_column]] == cell_type) %>% pull(cell_id)
+        
+        # Ensure we only ask for cells that exist in the matrix
+        ctrl_cells <- intersect(ctrl_cells, rownames(celltype_exp))
+        case_cells <- intersect(case_cells, rownames(celltype_exp))
+        
+        # Extract gene_sets of current celltype
+        celltype_gene_sets <- c(cytopus_gene_sets[[cell_type]], cytopus_gene_sets[["global"]])
+        program_names <- names(celltype_gene_sets)
+        
+        test_results_list <- lapply(program_names, function(prog_name) {
+                # Retrieve genes involved in the program
+                program_genes <- unlist(celltype_gene_sets[[prog_name]])
+                valid_genes   <- intersect(program_genes, colnames(celltype_exp))
+                
+                # Skip if no valid genes to prevent matrix subsetting errors
+                if(length(valid_genes) == 0) {
+                        return(data.frame("cell_type"=cell_type,
+                                          "program"=prog_name,
+                                          "statistic"=NA,
+                                          "p"=NA,
+                                          "ctrl_cells_count" = NA,
+                                          "case_cells_count"=NA))
+                }
+                
+                expr_ctrl_vals <- as.vector(celltype_exp[ctrl_cells, valid_genes, drop = FALSE])
+                expr_case_vals <- as.vector(celltype_exp[case_cells, valid_genes, drop = FALSE])
+                
+                # Try to compute the test
+                test_res <- try(wilcox.test(x = expr_ctrl_vals, y = expr_case_vals, paired = FALSE))
+                
+                if (inherits(test_res, "try-error")) {
+                        return(data.frame("cell_type"=cell_type,
+                                          "program"=prog_name,
+                                          "statistic"=NA,
+                                          "p"=NA,
+                                          "ctrl_cells_count"=NA,
+                                          "case_cells_count"=NA))
+                } else {
+                        return(data.frame("cell_type"=cell_type,
+                                          "program"=prog_name,
+                                          "statistic"=test_res$statistic,
+                                          "p"=test_res$p.value,
+                                          "ctrl_cells_count"=length(expr_ctrl_vals),
+                                          "case_cells_count"=length(expr_case_vals)))
+                }
+        })
+        tests <- bind_rows(test_results_list)
+        return(tests)
+})
+
+IGP_expression_WMW <- bind_rows(res_welch)
+
+# Compute FDR to account for multiple testing
+IGP_expression_WMW <- IGP_expression_WMW %>%
+                                drop_na() %>% 
+                                group_by(cell_type) %>% 
+                                mutate(FDR = p.adjust(p, method = "fdr")) %>% 
+                                ungroup() %>% 
+                                relocate(FDR, .after = p) %>% 
+                                # Apply the Rank-Biserial Formula using the sample sizes
+                                mutate(effect_size = abs(1 - (2 * statistic) / (as.numeric(ctrl_cells_count) * as.numeric(case_cells_count))))
+
+write_csv(IGP_expression_WMW, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/IPG_expression_WMW_test.csv"))
+```
+
+## Boxplots - facet and per celltype
+
+Plot expression distribution for all genes belonging to each program for each cell type in case vs control, only in comparisons where the difference is significant according to the Welch test
+
+```{r}
+# Extract significant tests
+WMW_sig <- IGP_expression_WMW %>% dplyr::filter(FDR <0.05 & effect_size > 0.3)
+
+# One plot per type as well as facet
+plots <- lapply(unique(WMW_sig$cell_type), function(celltype){
+        
+        # Subset gene expression to keep only current cell type
+        celltype_exp <- GetAssayData(subset(data, idents = celltype), assay = "RNA", layer = "data")
+        celltype_exp <- t(as.matrix(celltype_exp))
+        
+        # For the current celltype, extract gene expression for eachy significant program
+        plot_data <- lapply(WMW_sig %>% dplyr::filter(cell_type == celltype) %>% pull(program), function(program_name){
+                
+                # Get genes involved in program (Check if program is cell specific or general)
+                if (str_split_i(program_name, "_", 1) == "all") {
+                        program_genes <- unlist(cytopus_gene_sets[["global"]][[program_name]])
+                }else{
+                        program_genes <- unlist(cytopus_gene_sets[[celltype]][[program_name]])
+                }
+                valid_genes <- intersect(program_genes, colnames(celltype_exp))
+                # Get expression for these genes, pivot and set cell_id as column
+                program_genes_exp <- celltype_exp[,valid_genes] %>% as.data.frame() %>% rownames_to_column(var = "cell_id")
+                program_genes_exp <- program_genes_exp %>% pivot_longer(cols = colnames(program_genes_exp)[-1])
+                # Add information about condition
+                program_genes_exp <- program_genes_exp %>% left_join(metadata %>% dplyr::select(cell_id, Diagnosis))
+                # Add program column
+                program_genes_exp <- program_genes_exp %>% mutate(program = program_name)
+        })
+        plot_data <- bind_rows(plot_data)
+        
+        # Plot boxplot for this celltype
+        p <- plot_data %>% ggplot(aes(x=program, y=log(value), fill=Diagnosis)) +
+                                geom_boxplot() +
+                                labs(title = paste0("IGP with significant differences in gene expression between case and control in ",celltype," cells."),
+                                     y = "log(Gene expression)"
+                                ) +
+                                theme(axis.text.x = element_text(hjust=1, angle=45, size=8)) +
+                                stat_compare_means(
+                                        aes(group = Diagnosis),
+                                        method = "t.test",
+                                        label = "p.signif",
+                                        method.args = list(var.equal=FALSE),
+                                        vjust = -1,
+                                        size = 3
+                                ) +
+                                stat_summary(
+                                    fun.data = function(y) {
+                                      return(data.frame(
+                                        y = max(y),
+                                        label = paste0("n= ",length(y))
+                                      ))
+                                    },
+                                    geom = "text",
+                                    position = position_dodge(width = 0.75),
+                                    vjust = -0.5,
+                                    size = 3
+                                  ) +
+                                theme_minimal()
+                                                                                        
+        
+        ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation,"_annotation/wilcoxon_test/boxplots_DEG/boxplot_wilcoxon_significant_", gsub("/", "_", celltype),".pdf"), plot = p, device = "pdf", width = 10, height = 7, create.dir = TRUE)
+        
+        return(p)
+})
+
+combined_plot <- wrap_plots(plots)
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation ,"_annotation/wilcoxon_test/boxplots_DEG/boxplot_wilcoxon_significant_facet.pdf"), plot = combined_plot, width = 25, height = 25, create.dir = TRUE)
+```
+
+## Scatter plot FDR vs effect size
+```{r}
+# create tag for labels and deregulation column
+effect_size_thresh_medium <- 0.3
+effect_size_thresh_high <- 0.5
+FDR_thresh <- 0.05
+
+plot_data <- IGP_expression_WMW %>% 
+                mutate(tag            = paste0(cell_type, "-", program),
+                       effect         = ifelse(FDR<FDR_thresh & effect_size > effect_size_thresh_medium, "Medium effect size", "Small effect size"),
+                       effect         = ifelse(FDR<FDR_thresh & effect_size > effect_size_thresh_high, "High effect size", effect),
+                       effect         = as.factor(effect))
+
+p <- plot_data %>% ggplot(aes(x=effect_size, y=-log10(FDR), color = effect)) +
+                        geom_point(size = 1) +
+                        scale_color_manual(values = c("High effect size" = "red", "Medium effect size" = "purple", "Small effect size" = "grey")) +
+                        geom_vline(xintercept = 0.3, col = 'grey', linetype = 'dashed') +
+                        geom_hline(yintercept = -log10(0.05), col = 'grey', linetype = 'dashed') +
+                        labs(
+                                title    = "Wilcoxon rank sum test",
+                                subtitle = "comparison between gene expression in case vs control, for each program in each cell type",
+                                x        = "Effect size") +
+                        geom_label_repel(
+                                data = plot_data %>% filter((FDR<FDR_thresh & effect_size>effect_size_thresh_medium)),
+                                aes(label = tag),
+                                size = 2.5,           
+                                max.overlaps = Inf,   
+                                box.padding = 0.5,
+                                point.padding = 0.2,
+                                min.segment.length = 0,
+                                nudge_x = .15,
+                                nudge_y = .5,) +
+                        theme_minimal()
+p
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/scatterplot_wilcoxon_DEG.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+```
+
+# Linear Mixed Model (DAP)
+
+In Welch's test each cell is seen as an inpdendent measurement, ingoring the possible collinearity of cells belonging to the same patient. Linear Mixed Models correct for this modeling the patient id as a random effect.
+
+```{r message=FALSE, warning=FALSE}
+res_lmm <- lapply(unique(cell_scores$annotation),
+                function(cell_type){
+                        # Subset cell scores to keep only current cell type
+                        celltype_cell_score <- cell_scores %>% dplyr::filter(annotation == cell_type)
+                        # Prepare dataset to store Welch's test results
+                        tests <- data_frame("cell_type"=character(), "program"=character(), "term"=character(), "active_cells_control_perc"=numeric(), "active_cells_case_perc"=numeric(), "avg_control_activation"=numeric(), "avg_case_activation"= numeric(), "estimate"=numeric(),
+                                            "std.err"=numeric(), "statistic"=numeric(), "p"=numeric())
+                        # For each program, test for difference in activation between case and control, only in active cells (activation > 0.001) as per Authors suggestion
+                        for (program in colnames(celltype_cell_score)[6:length(colnames(celltype_cell_score))]) {
+                                # Compute number of active cells (activation > 0.001) in this cell type
+                                perc_active_cells_control <- round((celltype_cell_score %>%
+                                                                        dplyr::filter(Diagnosis == "Control" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                perc_active_cells_case <-    round((celltype_cell_score %>%
+                                                                        dplyr::filter(Diagnosis == "IPF" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                # Compute average activation in case vs control
+                                avg_control_activation <- celltype_cell_score %>%
+                                                                dplyr::filter(Diagnosis == "Control") %>% 
+                                                                pull(any_of(program)) %>% 
+                                                                mean()
+                                avg_case_activation <- celltype_cell_score %>%
+                                                                dplyr::filter(Diagnosis == "IPF") %>% 
+                                                                pull(any_of(program)) %>% 
+                                                                mean()
+                                # Try to compute the test, it might fail if not enough cells are active
+                                data <- celltype_cell_score %>% dplyr::select(Diagnosis, Sample_Name, all_of(program)) %>% dplyr::filter(.[[program]]>0.001)
+                                colnames(data) <- c("Diagnosis", "Sample_Name", "Program")
+                                test_res <- try(lmer(Program ~ Diagnosis + (1|Sample_Name), data = data),
+                                                silent = TRUE)
+                                if (inherits(test_res, "try-error")) {
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, term = NA, "active_cells_control_perc"=perc_active_cells_control,
+                                                                  "active_cells_case_perc"=perc_active_cells_case, "avg_control_activation"=avg_control_activation,
+                                                                  "avg_case_activation"=avg_case_activation, "estimate"=NA, "std.err"=NA,"statistic"=NA, "p"=NA)
+                                                       )
+                                }else{
+                                        test_res <- tidy(test_res, effects = "fixed")[2,]
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, "term"=test_res$term,
+                                                                  "active_cells_control_perc"=perc_active_cells_control, "active_cells_case_perc"=perc_active_cells_case,
+                                                                  "avg_control_activation"=avg_control_activation,"avg_case_activation"=avg_case_activation,
+                                                                  "estimate"=test_res$estimate, "std.err"=test_res$std.error, "statistic"=test_res$statistic, "p"=test_res$p.value)
+                                                       )
+                                }
+                        }
+                        return(tests)
+                }
+        )
+IGP_activation_lmm <- bind_rows(res_lmm)
+IGP_activation_lmm <- IGP_activation_lmm %>% 
+                        drop_na() %>% 
+                        group_by(cell_type) %>% 
+                        mutate(FDR = p.adjust(p, method = "fdr")) %>% 
+                        ungroup()
+# Compute effect size as activationFC log2((avg_control_activation + estimate)/avg_case_activation)
+IGP_activation_lmm <- IGP_activation_lmm %>% mutate(log2FC = log2((avg_control_activation+estimate)/avg_control_activation))
+
+if(! dir.exists(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/lmm/"))){dir.create(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/lmm/"), recursive = TRUE)}
+write_csv(IGP_activation_lmm, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/lmm/IPG_activation_lmm.csv"))
+```
+
+## Volcano plot
+```{r}
+# create tag for labels and deregulation column
+FC_thresh <- 1
+FDR_thresh <- 0.05
+
+plot_data <- IGP_activation_lmm %>%
+                dplyr::filter(!log2FC=="NaN" ) %>% 
+                mutate(tag = paste0(cell_type, "-", str_split_i(program, "-X-",3)),
+                       diff_activated = ifelse(FDR<FDR_thresh & log2FC>FC_thresh, "UP", "NO"),
+                       diff_activated = ifelse(FDR<FDR_thresh & log2FC< -FC_thresh, "DOWN", diff_activated))
+
+p <- plot_data %>% ggplot(aes(x=log2FC, y=-log10(FDR), color = diff_activated)) +
+                geom_point(size = 1) +
+                scale_color_manual(values = c("red", "grey", "purple"),
+                                   labels = c("Downactivated", "Not significant", "Overactivated")) +
+                geom_vline(xintercept = c(-1, 1), col = 'grey', linetype = 'dashed') +
+                geom_hline(yintercept = -log10(0.05), col = 'grey', linetype = 'dashed') +
+                labs(
+                        title = "Linear Mixed Model - Sample ID as random effect",
+                        subtitle = "comparison between activation in case vs control, for each program in each cell type",
+                        x = "log2(activation FC)"
+                        ) +
+                geom_label_repel(
+                        data = plot_data %>% filter((FDR<FDR_thresh & log2FC>FC_thresh) | (FDR<FDR_thresh & log2FC< -FC_thresh)),
+                        aes(label = tag),
+                        size = 2.5,           
+                        max.overlaps = Inf,   
+                        box.padding = 0.5,
+                        point.padding = 0.2,
+                        min.segment.length = 0,
+                        nudge_x = .15,
+                        nudge_y = .5,) +
+                theme_minimal()
+p
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/lmm/volcano_lmm.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+```
+
+
+# Linear Mixed Model - cell cycle phase correction (DAP)
+
+```{r message=FALSE, warning=FALSE}
+res_lmm <- lapply(unique(cell_scores$annotation),
+                function(cell_type){
+                        # Subset cell scores to keep only current cell type
+                        celltype_cell_score <- cell_scores %>% dplyr::filter(annotation == cell_type)
+                        # Prepare dataset to store Welch's test results
+                        tests <- data_frame("cell_type"=character(), "program"=character(), "term"=character(), "active_cells_control_perc"=numeric(), "active_cells_case_perc"=numeric(), "avg_control_activation"=numeric(), "avg_case_activation"= numeric(), "estimate"=numeric(),
+                                            "std.err"=numeric(), "statistic"=numeric(), "p"=numeric())
+                        # For each program, test for difference in activation between case and control, only in active cells (activation > 0.001) as per Authors suggestion
+                        for (program in colnames(celltype_cell_score)[6:length(colnames(celltype_cell_score))]) {
+                                # Compute number of active cells (activation > 0.001) in this cell type
+                                perc_active_cells_control <- round((celltype_cell_score %>%
+                                                                        dplyr::filter(Diagnosis == "Control" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                perc_active_cells_case <-    round((celltype_cell_score %>%
+                                                                        dplyr::filter(Diagnosis == "IPF" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                # Compute average activation in case vs control
+                                avg_control_activation <- celltype_cell_score %>%
+                                                                dplyr::filter(Diagnosis == "Control") %>% 
+                                                                pull(any_of(program)) %>% 
+                                                                mean()
+                                avg_case_activation <- celltype_cell_score %>%
+                                                                dplyr::filter(Diagnosis == "IPF") %>% 
+                                                                pull(any_of(program)) %>% 
+                                                                mean()
+                                # Try to compute the test, it might fail if not enough cells are active
+                                data <- celltype_cell_score %>% dplyr::select(Diagnosis, Sample_Name, Phase, all_of(program)) %>% dplyr::filter(.[[program]]>0.001)
+                                colnames(data) <- c("Diagnosis", "Sample_Name", "Phase", "Program")
+                                test_res <- try(lmer(Program ~ Diagnosis + Phase + (1|Sample_Name), data = data),
+                                                silent = TRUE)
+                                if (inherits(test_res, "try-error")) {
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, term = NA, "active_cells_control_perc"=perc_active_cells_control,
+                                                                  "active_cells_case_perc"=perc_active_cells_case, "avg_control_activation"=avg_control_activation,
+                                                                  "avg_case_activation"=avg_case_activation, "estimate"=NA, "std.err"=NA, "statistic"=NA, "p"=NA)
+                                                       )
+                                }else{
+                                        test_res <- tidy(test_res, effects = "fixed")[2:3,]
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, "term"=test_res$term,
+                                                                  "active_cells_control_perc"=perc_active_cells_control, "active_cells_case_perc"=perc_active_cells_case,
+                                                                  "avg_control_activation"=avg_control_activation, "avg_case_activation"=avg_case_activation,
+                                                                  "estimate"=test_res$estimate, "std.err"=test_res$std.error, "statistic"=test_res$statistic, "p"=test_res$p.value)
+                                                       )
+                                }
+                        }
+                        return(tests)
+                }
+        )
+IGP_activation_lmm_phase_corrected <- bind_rows(res_lmm)
+IGP_activation_lmm_phase_corrected <- IGP_activation_lmm_phase_corrected %>% 
+                        drop_na() %>% 
+                        group_by(cell_type) %>% 
+                        mutate(FDR = p.adjust(p, method = "fdr")) %>% 
+                        ungroup()
+# Compute effect size as activationFC log2((avg_control_activation + estimate)/avg_case_activation)
+IGP_activation_lmm_phase_corrected <- IGP_activation_lmm_phase_corrected %>% mutate(log2FC = log2((avg_control_activation+estimate)/avg_control_activation))
+
+write_csv(IGP_activation_lmm_phase_corrected, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/lmm/IPG_activation_lmm_phase_corrected.csv"))
+```
+
+## Volcano plot
+```{r}
+# create tag for labels and deregulation column
+FC_thresh <- 1
+FDR_thresh <- 0.05
+
+plot_data <- IGP_activation_lmm_phase_corrected %>%
+                dplyr::filter(!log2FC=="NaN",
+                       !str_detect(term, "Phase")) %>% 
+                mutate(tag = paste0(cell_type, "-", str_split_i(program, "-X-",3)),
+                       diff_activated = ifelse(FDR<FDR_thresh & log2FC>FC_thresh, "UP", "NO"),
+                       diff_activated = ifelse(FDR<FDR_thresh & log2FC< -FC_thresh, "DOWN", diff_activated))
+
+p <- plot_data %>% ggplot(aes(x=log2FC, y=-log10(FDR), color = diff_activated)) +
+                geom_point(size = 1) +
+                scale_color_manual(values = c("red", "grey", "purple"),
+                                   labels = c("Downactivated", "Not significant", "Overactivated")) +
+                geom_vline(xintercept = c(-1, 1), col = 'grey', linetype = 'dashed') +
+                geom_hline(yintercept = -log10(0.05), col = 'grey', linetype = 'dashed') +
+                labs(
+                        title = "Linear Mixed Model - Sample ID as random effect, correcting for cell cycle phase",
+                        subtitle = "comparison between activation in case vs control, for each program in each cell type",
+                        x = "log2(activation FC)"
+                        ) +
+                geom_label_repel(
+                        data = plot_data %>% filter((FDR<FDR_thresh & log2FC>FC_thresh) | (FDR<FDR_thresh & log2FC< -FC_thresh)),
+                        aes(label = tag),
+                        size = 2.5,           
+                        max.overlaps = Inf,   
+                        box.padding = 0.5,
+                        point.padding = 0.2,
+                        min.segment.length = 0,
+                        nudge_x = .15,
+                        nudge_y = .5,) +
+                theme_minimal()
+p
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation,"_annotation/lmm/volcano_lmm_phase_corrected.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+```
+
+# Comparison DEG vs DAP
+
+Compare gene deregulation (DEG) with differentialy activated program (DAP)
+
+## Perform DE analysis
+
+- Load original Seurat object
+- perform differential analysis per cell type across condition
+
+### SC
+```{r}
+# Create new metadata column to use as comparison in DE analysis
+data@meta.data <- data@meta.data %>% 
+                        mutate(celltype_condition = paste0(.[[annotation_column]], "-", Diagnosis))
+Idents(data) <- "celltype_condition"
+```
+
+Run DE in parallel for each cell type
+```{r}
+cores <- 10
+
+res_DE <- mclapply(unique(data@meta.data[,annotation_column]),
+                function(cell_type){
+                        return(FindMarkers(data, ident.1 = paste0(cell_type, "-IPF"), ident.2 = paste0(cell_type, "-Control")) %>%
+                                       mutate(celltype = cell_type,
+                                              FDR = p.adjust(p_val, method = "BH")) %>%
+                                       rownames_to_column(var = "gene"))
+                },
+                mc.cores = cores,
+                mc.cleanup = TRUE)
+# Combine results from different cell types
+DEGs <- bind_rows(res_DE)
+```
+
+#### Define Log2FC threshold
+```{r}
+FDR_thresh <- 0.01
+
+# Check FDR quantiles per cell type to set thresholds (only considering test below FDR threshold)
+res_quant <- lapply(unique(data@meta.data[,annotation_column]),
+                        function(cell_type){
+                                FC_dist <- ecdf(DEGs %>% filter(cell_type == celltype & FDR < FDR_thresh) %>% pull(avg_log2FC) %>% abs())
+                                quant <- data.frame(celltype = cell_type,
+                                                    genes_below_FDR = DEGs %>% filter(cell_type == celltype & FDR < FDR_thresh) %>% nrow(),
+                                                    FC_0.2_perc  = round((1 - FC_dist(0.2))*100, 2),
+                                                    FC_0.2_count = DEGs %>% filter(cell_type == celltype & FDR < FDR_thresh & abs(avg_log2FC) > 0.2) %>% nrow(),
+                                                    FC_0.5_perc  = round((1 - FC_dist(0.5))*100, 2),
+                                                    FC_0.5_count = DEGs %>% filter(cell_type == celltype & FDR < FDR_thresh & abs(avg_log2FC) > 0.5) %>% nrow(),
+                                                    FC_0.7_perc  = round((1 - FC_dist(0.7))*100, 2),
+                                                    FC_0.7_count = DEGs %>% filter(cell_type == celltype & FDR < FDR_thresh & abs(avg_log2FC) > 0.7) %>% nrow(),
+                                                    FC_1_perc    = round((1 - FC_dist(1))*100, 2),
+                                                    FC_1_count   = DEGs %>% filter(cell_type == celltype & FDR < FDR_thresh & abs(avg_log2FC) > 1) %>% nrow(),
+                                                    FC_1.5_perc  = round((1 - FC_dist(1.5))*100, 2),
+                                                    FC_1.5_count   = DEGs %>% filter(cell_type == celltype & FDR < FDR_thresh & abs(avg_log2FC) > 1.5) %>% nrow(),
+                                                    FC_2_perc  = round((1 - FC_dist(2))*100, 2),
+                                                    FC_2_count   = DEGs %>% filter(cell_type == celltype & FDR < FDR_thresh & abs(avg_log2FC) > 2) %>% nrow())
+                                                
+                        })
+# Combine results from different cell types
+FDR_quantiles <- bind_rows(res_quant)
+rownames(FDR_quantiles) <- seq(1,nrow(FDR_quantiles))
+
+# Choose Log2FC threshold
+FC_thresh  <- 1.5
+# Label deregulated genes
+DEGs <- DEGs %>% mutate(is_sig = ifelse(FDR < FDR_thresh & abs(avg_log2FC) > FC_thresh, TRUE, FALSE),
+                        class  = ifelse(avg_log2FC > 0, "UP", "DOWN"))
+sig_DEGs_stats <- FDR_quantiles %>% dplyr::select(celltype, genes_below_FDR, paste0("FC_", FC_thresh, "_perc"),paste0("FC_", FC_thresh, "_count"))
+```
+
+### PSEUDO-BULK
+
+Pseudo bulk based on sample - condition - cell type
+```{r}
+data_pb <- AggregateExpression(data, assays = "RNA", return.seurat = TRUE, group.by = c("Sample_Name", "Diagnosis", annotation_column))
+# Create new idents
+data_pb$celltype_condition <- paste0(data_pb@meta.data[, annotation_column], "-", data_pb$Diagnosis)
+Idents(data_pb) <- "celltype_condition"
+
+
+```
+
+Run DE for each cell type
+```{r message=FALSE}
+res_DE_pb <- lapply(unique(data_pb@meta.data[,annotation_column]),
+                    function(cell_type){
+                            return(FindMarkers(data_pb, ident.1 = paste0(cell_type, "-IPF"), ident.2 = paste0(cell_type, "-Control"), test.use = "DESeq2") %>%
+                                           mutate(celltype = cell_type,
+                                                  FDR = p.adjust(p_val, method = "BH")) %>%
+                                           rownames_to_column(var = "gene")
+                            )
+                            }
+                    )
+# Combine results from different cell types
+DEGs_pb <- bind_rows(res_DE_pb)
+# Label deregulated genes
+DEGs_pb <- DEGs_pb %>% mutate(is_sig = ifelse(FDR < FDR_thresh & abs(avg_log2FC) > FC_thresh, TRUE, FALSE),
+                              is_sig = ifelse(is.na(p_val), FALSE, is_sig),
+                              class  = ifelse(avg_log2FC > 0, "UP", "DOWN"))
+```
+
+### Merge DEGs from sc and pseudo-bulk and save all 3 tables
+```{r}
+total_DEGs <- DEGs %>% full_join(DEGs_pb, by = c("gene", "celltype"), suffix = c("_sc", "_pb"))
+# Create flag for singificance both in sc and pb
+total_DEGs <- total_DEGs %>% mutate(both_sig = ifelse(is_sig_sc == TRUE & is_sig_pb == TRUE, TRUE, FALSE))
+
+
+if(! dir.exists(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/"))){dir.create(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/"), recursive = TRUE)}
+# Save all 3
+write_csv(DEGs, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/sc_DEGs.csv"))
+write_csv(DEGs_pb, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/pb_DEGs.csv"))
+write_csv(total_DEGs, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/total_DEGs.csv"))
+```
+
+## Check overlap of DEGs in sc vs pseudo bulk
+```{r}
+plot_list <- lapply(unique(data@meta.data[[annotation_column]]), function(cell_type) {
+  
+                  sc_genes <- DEGs %>% dplyr::filter(is_sig == TRUE, celltype == cell_type) %>% pull(gene)
+                  pb_genes <- DEGs_pb %>% dplyr::filter(is_sig == TRUE, celltype == cell_type) %>% pull(gene)
+                  
+                  fit <- euler(list("sc" = sc_genes, "Pseudo-bulk" = pb_genes))
+                  
+                  # Plot ven
+                  p1 <- as.ggplot(plot(fit, quantities = TRUE, fills = c("skyblue", "pink"), alpha = 0.5))
+                  # Combine with correlation of FC in sc vs pb
+                  p2 <- total_DEGs %>%
+                        dplyr::filter(both_sig, celltype == cell_type) %>% 
+                        dplyr::select(avg_log2FC_sc, avg_log2FC_pb) %>%
+                        drop_na() %>%
+                        ggplot(aes(x = avg_log2FC_sc, y = avg_log2FC_pb)) +
+                                geom_point_rast(size = 0.1) +
+                                geom_smooth(method=lm , color="red", fill="#69b3a2", se=TRUE, size = 0.25) +
+                                labs(title = cell_type) +
+                                theme_minimal()
+                  p <- wrap_plots(c(p1, p2)) + plot_annotation(title = cell_type)
+})
+
+combined_plot <- wrap_plots(plot_list) + 
+  plot_annotation(title    = "Overlap between DEGs found in scDE and pseudo-bulkDE analyses",
+                  subtitle = "Scatterplot showing logFC correlation between genes significantly altered (FDR<0.05 and log2FC>1) in both analyses (venn intersection)" )
+
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation ,"_annotation/DE/sc_vs_pseudobulk_overlap.pdf"), plot = combined_plot, width = 25, height = 11, create.dir = TRUE)
+```
+
+
+## Check correlation between log2FCs and FDRs
+
+FDRs
+```{r}
+# Significant in one of the 2
+p1 <- total_DEGs %>%
+        dplyr::filter(is_sig_sc| is_sig_pb) %>% 
+        dplyr::select(FDR_sc, FDR_pb) %>%
+        drop_na() %>%
+        dplyr::filter(!FDR_sc == 0) %>% 
+        ggplot(aes(x = -log(FDR_sc), y = -log(FDR_pb))) +
+                geom_point_rast(size = 0.01, alpha = 0.07, raster.dpi = 400) +
+                geom_smooth(method=lm , color="red", fill="#69b3a2", se=TRUE, size = 0.25) +
+                labs(title = "Significant in at least one of the two analyses") +
+                theme_minimal()
+
+# Significant in both
+p2 <- total_DEGs %>%
+        dplyr::filter(both_sig) %>% 
+        dplyr::select(FDR_sc, FDR_pb) %>%
+        drop_na() %>%
+        dplyr::filter(!FDR_sc == 0) %>% 
+        ggplot(aes(x = -log(FDR_sc), y = -log(FDR_pb))) +
+                geom_point_rast(size = 0.01, alpha = 0.07, raster.dpi = 400) +
+                geom_smooth(method=lm , color="red", fill="#69b3a2", se=TRUE, size = 0.25) +
+                labs(title = "Significant in both analyses") +
+                theme_minimal()
+p <- wrap_plots(p1, p2) + plot_annotation(title = "Correlation between single cell and pseudobulk FDRs of differential analysis",
+                                          subtitle = "(Removed genes where single cell FDR was zero)")
+p
+
+ggsave(p, filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/FDR_sc_pb_correlation.pdf"), device = "pdf", width = 10, height = 5, create.dir = TRUE)
+```
+
+log2FC
+```{r}
+# Significant in one of the 2
+p1 <- total_DEGs %>%
+        dplyr::filter(is_sig_sc | is_sig_pb) %>% 
+        dplyr::select(avg_log2FC_sc, avg_log2FC_pb) %>%
+        drop_na() %>% 
+        ggplot(aes(x = avg_log2FC_sc, y = avg_log2FC_pb)) +
+                geom_point_rast(size = 0.01, alpha = 0.07, raster.dpi = 400) +
+                geom_smooth(method=lm , color="red", fill="#69b3a2", se=TRUE, size = 0.25) +
+                labs(title = "Significant in at least one of the two analyses") +
+                theme_minimal()
+
+# Significant in both
+p2 <- total_DEGs %>%
+        dplyr::filter(both_sig) %>% 
+        dplyr::select(avg_log2FC_sc, avg_log2FC_pb) %>%
+        drop_na() %>%
+        ggplot(aes(x = avg_log2FC_sc, y = avg_log2FC_pb)) +
+                geom_point_rast(size = 0.01, alpha = 0.07, raster.dpi = 400) +
+                geom_smooth(method=lm , color="red", fill="#69b3a2", se=TRUE, size = 0.25) +
+                labs(title = "Significant in both analyses") +
+                theme_minimal()
+p <- wrap_plots(p1, p2) + plot_annotation(title = "Correlation between single cell and pseudobulk Log2FC of differential analysis")
+p
+
+ggsave(p, filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/log2FC_sc_pb_correlation.pdf"), device = "pdf", width = 10, height = 5, create.dir = TRUE)
+```
+
+# DEGs enrichment
+
+## GSEA
+
+### Prepare ranks
+ 
+Fetch GO and REACTOME and "Hallmark" gene sets from msigDB
+```{r}
+# Fetch GO Biological Process 
+go_bp_df   <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP")
+go_bp_list <- split(x = go_bp_df$gene_symbol, f = go_bp_df$gs_name)
+
+# Fetch Reactome 
+reactome_df   <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")
+reactome_list <- split(x = reactome_df$gene_symbol, f = reactome_df$gs_name)
+
+gene_sets       <- list("GO"=go_bp_list, "REACTOME"=reactome_list, "CYTOPUS"=cytopus_list)
+gene_sets_names <- c("GO", "REACTOME", "CYTOPUS")
+```
+
+### Run gsea
+```{r}
+# Output path
+base_out_path <- paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation, "_annotation/enrichment/gsea/")
+
+# Define configurations for each analysis
+analysis_configs <- list(
+  sc = list(
+    sig_col    = "is_sig_sc",
+    fc_col     = "avg_log2FC_sc",
+    title_desc = "single cell DE analysis",
+    out_folder = "sc"
+  ),
+  pb = list(
+    sig_col    = "is_sig_pb",
+    fc_col     = "avg_log2FC_pb",
+    title_desc = "pseudo-bulk DE analysis",
+    out_folder = "pb"
+  ),
+  both = list(
+    sig_col    = "both_sig",
+    fc_col     = "avg_log2FC_pb", 
+    title_desc = "both single cell and pseudo-bulk DE analysis",
+    out_folder = "both"
+  )
+)
+
+# For each celltype run gsea for sc, pb and common DEGs
+for (cell_type in unique(total_DEGs$celltype)) {
+        
+        # Cytopus is cell type specific so it must be prepared for each celltype
+        cytopus_list <- c(cytopus_gene_sets[[cell_type]], cytopus_gene_sets[["global"]])
+        cytopus_list <- lapply(cytopus_list, function(x) {
+          as.character(unlist(x, use.names = FALSE))
+        })
+        
+        # Iterate over sc, pb, and both analyses
+        for (ana_name in names(analysis_configs)) {
+                cfg <- analysis_configs[[ana_name]]
+                
+                # Create rank for this celltype dynamically based on the configuration
+                celltype_DEGs <- total_DEGs %>% 
+                  dplyr::filter(celltype == cell_type, .data[[cfg$sig_col]]) %>% 
+                  dplyr::arrange(desc(.data[[cfg$fc_col]]))
+                
+                rank        <- celltype_DEGs[[cfg$fc_col]]
+                names(rank) <- celltype_DEGs$gene
+                
+                for (gene_set in gene_sets_names) {
+                        
+                        set.seed(42)
+                        fgsea_results <- fgsea(pathways = gene_sets[[gene_set]], 
+                                               stats    = rank,
+                                               minSize  = 5,
+                                               maxSize  = 500)
+                        
+                        sig_results   <- fgsea_results[padj < 0.05]
+                        top_up        <- head(sig_results[order(-NES)]$pathway, 10)
+                        top_down      <- head(sig_results[order(NES)]$pathway, 10)
+                        top_pathways  <- unique(c(top_up, top_down))
+                        
+                        if (!is_empty(top_pathways)) {
+                                p <- as.ggplot(plotGseaTable(gene_sets[[gene_set]][top_pathways],
+                                                             rank, 
+                                                             fgsea_results,
+                                                             gseaParam = 0.5)) +
+                                     labs(title = paste0("GSEA of DEGs according to ", cfg$title_desc, " for ", cell_type, " cells using ", gene_set, " gene set."))
+                                
+                                # Define output directory and filename prefix
+                                out_dir <- paste0(base_out_path, cfg$out_folder, "/", gene_set, "/")
+                                file_prefix <- paste0(out_dir, gsub("/", "_", cell_type))
+                                
+                                ggsave(p, filename = paste0(file_prefix, ".pdf"), device = "pdf", width = 12, height = 8, create.dir = TRUE)
+                                write_csv(sig_results, file = paste0(file_prefix, ".csv"))
+                        }
+                }
+        }
+}
+```
+
+
+## ORA
+
+```{r}
+# Output path
+base_ora_path <- paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation, "_annotation/enrichment/ora/")
+
+analyses      <- c("sc", "pb", "both")
+class_columns <- list("sc"="class_sc", "pb"="class_pb", "both"="class_pb")
+sig_columns   <- list("sc"="is_sig_sc", "pb"="is_sig_pb", "both"="both_sig")
+
+for (cell_type in unique(total_DEGs$celltype)) {
+        
+        # Prepare Cytopus term2gene once per cell type
+        cytopus_list <- c(cytopus_gene_sets[[cell_type]], cytopus_gene_sets[["global"]])
+        cytopus_list <- lapply(cytopus_list, function(x) as.character(unlist(x, use.names = FALSE)))
+        
+        cytopus_term2gene <- data.frame(
+                term = rep(names(cytopus_list), lengths(cytopus_list)),
+                gene = unlist(cytopus_list, use.names = FALSE)
+        )
+        
+        for (analysis in analyses) {
+                
+                # Loop through both UP and DOWN directions
+                for (dir in c("UP", "DOWN")) {
+                        
+                        # Extract significant DEGs for the current analysis type and direction dynamically
+                        sig_genes <- total_DEGs %>% 
+                                dplyr::filter(.data[[sig_columns[[analysis]]]] == TRUE,
+                                              .data[[class_columns[[analysis]]]] == dir,
+                                              celltype == cell_type) %>% 
+                                dplyr::pull(gene)
+                        # Get all valid human gene symbols from the database
+                        valid_symbols <- AnnotationDbi::keys(org.Hs.eg.db, keytype = "SYMBOL")
+                        
+                        # Keep only the genes that actually exist in the database
+                        mapped_genes <- intersect(sig_genes, valid_symbols)
+                        
+                        # Skip to the next iteration if there are no significant genes for this set
+                        if (length(mapped_genes) == 0) next 
+                        
+                        # Convert to ENTREZ ID for REACTOME
+                        sig_entrez <- clusterProfiler::bitr(mapped_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+                        
+                        # Initialize a list to store results for GO, REACTOME and CYTOPUS
+                        ora_results <- list()
+                        
+                        # 1. Run ORA against GO
+                        ora_results[["GO"]] <- enrichGO(gene    = mapped_genes,
+                                                        OrgDb   = org.Hs.eg.db,
+                                                        minGSSize = 5,
+                                                        keyType = "SYMBOL",
+                                                        ont     = "BP")
+                        
+                        # 2. Run ORA against REACTOME
+                        if (nrow(sig_entrez) > 0) {
+                                ora_results[["REACTOME"]] <- enrichPathway(gene = sig_entrez$ENTREZID,
+                                                                           minGSSize = 5,
+                                                                           pvalueCutoff = 0.05,
+                                                                           readable = TRUE)
+                        }
+                        
+                        # 3. Run ORA against Cytopus
+                        ora_results[["CYTOPUS"]] <- enricher(mapped_genes,
+                                                             minGSSize = 5,
+                                                             TERM2GENE = cytopus_term2gene)
+                        
+                        # Iterate over the completed results to validate, plot, and save
+                        for (db_name in names(ora_results)) {
+                                res <- ora_results[[db_name]]
+                                
+                                # Check if the result object is valid and contains significant adjusted p-values
+                                if (!is.null(res) && nrow(res@result) > 0 && min(res@result$p.adjust, na.rm = TRUE) < 0.05) {
+                                        
+                                        # Reduce redundancy specifically for GO
+                                        if (db_name == "GO") {
+                                                res <- clusterProfiler::simplify(res)
+                                        }
+                                        
+                                        # Format the title text based on direction
+                                        dir_text <- ifelse(dir == "UP", "up-regulated", "down-regulated")
+                                        
+                                        p <- dotplot(res, showCategory=20, font.size=10, label_format=70) +
+                                                scale_size_continuous(range=c(1, 7)) +
+                                                theme_minimal() +
+                                                ggtitle(paste0(db_name, " Enrichment of ", dir_text, " genes for ", cell_type, " cells."))
+                                        
+                                        # Define output directory and filename prefix
+                                        out_dir     <- paste0(base_ora_path, analysis, "/", db_name, "/")
+                                        file_prefix <- paste0(out_dir, gsub("/", "_", cell_type), "_", dir)
+                                        
+                                        ggsave(p, filename = paste0(file_prefix, ".pdf"), device = "pdf", width = 12, height = 8, create.dir = TRUE)
+                                        write_csv(res@result, file = paste0(file_prefix, ".csv"))
+                                }
+                        }
+                }
+        }
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
