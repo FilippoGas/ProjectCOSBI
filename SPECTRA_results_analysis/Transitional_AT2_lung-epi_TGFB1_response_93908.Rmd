@@ -1,0 +1,125 @@
+Filippo Gastaldello - 04/03/2026
+
+Relative to SPECTRA run 93908
+
+Analyis of gene program "lung-epi TGFB1 response" activation in Transitional AT2 cells and KRT5−/KRT17+ cells
+
+
+```{r}
+library(tidyverse)
+library(eulerr)
+library(ggVennDiagram)
+library(ggplotify)
+library(fgsea)
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+library(msigdbr)
+
+output_dir <- "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/manual_annotation/IGP_interpretation/lung-epi_TGFB1_response/"
+```
+
+The gene program was identified twice in Transitional AT2 and once in KRT5-/KRT17+, respectively with index 419, 421 and 289 (This indexes may change by rerunning spectra). This most likely means that the three instances represent slightly different subprocesses of this gene program. Let's see how they differ by performing enrichment on the marker genes for each factor (as suggested in https://github.com/dpeerlab/spectra/issues/24 )
+
+# Extract marker genes for each program
+```{r}
+IGP_of_interest <- c("419-X-Transitional AT2-X-lung-epi_TGFB1_response",
+                     "421-X-Transitional AT2-X-lung-epi_TGFB1_response",
+                     "289-X-KRT5-/KRT17+-X-lung-epi_TGFB1_response")
+
+# Load marker genes
+markers <- read_csv("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/manual_annotation/Natri_et_al_full_manual_anno_factor_markers_93908.hpc3-head1.unitn.it.csv") %>% select(all_of(IGP_of_interest)) %>% as.list()
+```
+# Check overlap of marker genes
+```{r}
+# Compute overlaps
+fit <- euler(markers)
+# Plot venn
+p <- as.ggplot(plot(fit, quantities = TRUE, fills = c("skyblue", "pink"), alpha = 0.5))
+ggsave(plot = p, filename = paste0(output_dir, "markers_overlap.pdf"), device = "pdf", width = 8, height = 5, create.dir = TRUE)
+```
+# ORA
+
+Let's perform Over Representation Analysis against GO and REACTOME for each set of markers.
+```{r}
+lapply(seq(1, length(markers)), function(i){
+        factor_name    <- names(markers)[i]
+        factor_markers <- markers[[i]] 
+        
+        # GO
+        GO_results <- enrichGO(gene = factor_markers, OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP")
+        p <- dotplot(GO_results, font.size=10, label_format=70) +
+                scale_size_continuous(range=c(1, 7)) +
+                theme_minimal() +
+                ggtitle(paste0("GO Enrichment of factor markers for ",factor_name," cells."))
+        ggsave(plot = p, filename = paste0(output_dir, "ORA/GO/", factor_name, ".pdf"), device = "pdf", height = 8, width = 12, create.dir = TRUE)
+        
+        # REACTOME (Need to convert symbol to EntrezID)
+        factor_markers_entrez <- bitr(factor_markers, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+        REACTOME_results <- enrichPathway(gene = factor_markers_entrez$ENTREZID,
+                                          pvalueCutoff = 0.05,
+                                          pAdjustMethod = "BH",
+                                          readable = T)
+        p <- dotplot(REACTOME_results, font.size=10, label_format=70) +
+                scale_size_continuous(range=c(1, 7)) +
+                theme_minimal() +
+                ggtitle(paste0("REACTOME Enrichment of factor markers for ",factor_name," cells."))
+        ggsave(plot = p, filename = paste0(output_dir, "ORA/REACTOME/", factor_name, ".pdf"), device = "pdf", height = 8, width = 12, create.dir = TRUE)
+})
+```
+# GSEA
+
+Given that sets 419 and 421 are present in the same cell type (Transitional AT2) with opposite deregulation directions, let's merge the marker lists for the two factors, get DE analysis results for those genes in the cell type of interest, and run GSEA
+
+Fetch GO and REACTOME gene sets
+```{r}
+# Fetch GO Biological Process 
+go_bp_df <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP")
+go_bp_list <- split(x = go_bp_df$gene_symbol, f = go_bp_df$gs_name)
+
+# Fetch Reactome 
+reactome_df <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")
+reactome_list <- split(x = reactome_df$gene_symbol, f = reactome_df$gs_name)
+```
+
+```{r}
+# Merge markers from factors 419 and 421
+joined_markers <- c(markers[[1]], markers[[2]]) %>% unique()
+# Get DE analysis results for these genes
+DEGs <- read_csv("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/manual_annotation/DE/sc_DEGs.csv")
+DEGs <- DEGs %>% filter(celltype == "Transitional AT2") %>% filter(gene %in% joined_markers, FDR < 0.05)
+
+# Prepare ranks
+DEGs <- DEGs %>% arrange(desc(avg_log2FC))
+rank <- DEGs$avg_log2FC
+names(rank) <- DEGs$gene
+
+# GO
+set.seed(42)
+fgsea_results <- fgsea(pathways = go_bp_list, 
+                       stats    = rank,
+                       minSize  = 15,
+                       maxSize  = 500)
+sig_results <- fgsea_results[padj < 0.05]
+p <- as.ggplot(plotGseaTable(go_bp_list[sig_results$pathway],
+                             rank,
+                             fgsea_results,
+                             gseaParam = 0.5)) +
+                labs(title = paste0("GSEA of Transitional AT2's DEGs involved in TGFB1 response (GO:BP)"))
+ggsave(plot = p, filename = paste0(output_dir, "GSEA/GO/Transitional_AT2_lung-epi_TGFB1_response.pdf"), device = "pdf", height = 8, width = 12, create.dir = TRUE)
+
+# REACTOME
+set.seed(42)
+fgsea_results <- fgsea(pathways = reactome_list, 
+                       stats    = rank,
+                       minSize  = 15,
+                       maxSize  = 500)
+sig_results <- fgsea_results[padj < 0.05]
+p <- as.ggplot(plotGseaTable(reactome_list[sig_results$pathway],
+                             rank,
+                             fgsea_results,
+                             gseaParam = 0.5)) +
+                labs(title = paste0("GSEA of Transitional AT2's DEGs involved in TGFB1 response (REACTOME"))
+ggsave(plot = p, filename = paste0(output_dir, "GSEA/REACTOME/Transitional_AT2_lung-epi_TGFB1_response.pdf"), device = "pdf", height = 8, width = 12, create.dir = TRUE)
+```
+
