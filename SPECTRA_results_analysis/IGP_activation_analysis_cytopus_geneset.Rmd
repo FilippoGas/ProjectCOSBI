@@ -982,6 +982,7 @@ Compare gene deregulation (DEG) with differentialy activated program (DAP)
 - Load original Seurat object
 - perform differential analysis per cell type across condition
 
+
 ### SC
 ```{r}
 # Create new metadata column to use as comparison in DE analysis
@@ -1037,9 +1038,12 @@ rownames(FDR_quantiles) <- seq(1,nrow(FDR_quantiles))
 
 # Choose Log2FC threshold
 FC_thresh  <- 1.5
-# Label deregulated genes
+# Retrieve the second lowest p value (the lowest might be zero in sc DE analysis) to use as pseudo-count for rank metric
+lowest_p <- (DEGs$FDR %>% unique() %>% sort())[2]
+# Label deregulated genes and add rank metric (-log10(FDR)*log2FC)
 DEGs <- DEGs %>% mutate(is_sig = ifelse(FDR < FDR_thresh & abs(avg_log2FC) > FC_thresh, TRUE, FALSE),
-                        class  = ifelse(avg_log2FC > 0, "UP", "DOWN"))
+                        class  = ifelse(avg_log2FC > 0, "UP", "DOWN"),
+                        rank   = -log10(FDR+lowest_p)*avg_log2FC) # pseudo count to avoid computing log(0) in case of inflated pvalues
 sig_DEGs_stats <- FDR_quantiles %>% dplyr::select(celltype, genes_below_FDR, paste0("FC_", FC_thresh, "_perc"),paste0("FC_", FC_thresh, "_count"))
 ```
 
@@ -1068,10 +1072,11 @@ res_DE_pb <- lapply(unique(data_pb@meta.data[,annotation_column]),
                     )
 # Combine results from different cell types
 DEGs_pb <- bind_rows(res_DE_pb)
-# Label deregulated genes
+# Label deregulated genes and add rank metric (-log10(FDR)*log2FC)
 DEGs_pb <- DEGs_pb %>% mutate(is_sig = ifelse(FDR < FDR_thresh & abs(avg_log2FC) > FC_thresh, TRUE, FALSE),
                               is_sig = ifelse(is.na(p_val), FALSE, is_sig),
-                              class  = ifelse(avg_log2FC > 0, "UP", "DOWN"))
+                              class  = ifelse(avg_log2FC > 0, "UP", "DOWN"),
+                              rank   = -log10(FDR)*avg_log2FC)
 ```
 
 ### Merge DEGs from sc and pseudo-bulk and save all 3 tables
@@ -1192,12 +1197,18 @@ ggsave(p, filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSB
 Fetch GO and REACTOME and "Hallmark" gene sets from msigDB
 ```{r}
 # Fetch GO Biological Process 
-go_bp_df   <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP")
+go_bp_df   <- msigdbr(species = "Homo sapiens", collection = "C5", subcollection = "GO:BP")
 go_bp_list <- split(x = go_bp_df$gene_symbol, f = go_bp_df$gs_name)
 
 # Fetch Reactome 
-reactome_df   <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")
+reactome_df   <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:REACTOME")
 reactome_list <- split(x = reactome_df$gene_symbol, f = reactome_df$gs_name)
+
+# Create cytopus_list
+cytopus_list        <- unlist(cytopus_gene_sets, recursive = FALSE)
+names(cytopus_list) <- str_split_i(names(cytopus_list), "\\.",2) 
+cytopus_list        <- cytopus_list[!duplicated(names(cytopus_list))]
+cytopus_list        <- lapply(cytopus_list, function(x){unlist(x)})
 
 gene_sets       <- list("GO"=go_bp_list, "REACTOME"=reactome_list, "CYTOPUS"=cytopus_list)
 gene_sets_names <- c("GO", "REACTOME", "CYTOPUS")
@@ -1212,45 +1223,35 @@ base_out_path <- paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/da
 analysis_configs <- list(
   sc = list(
     sig_col    = "is_sig_sc",
-    fc_col     = "avg_log2FC_sc",
+    rank_col   = "rank_sc",
     title_desc = "single cell DE analysis",
     out_folder = "sc"
   ),
   pb = list(
     sig_col    = "is_sig_pb",
-    fc_col     = "avg_log2FC_pb",
+    rank_col   = "rank_pb",
     title_desc = "pseudo-bulk DE analysis",
     out_folder = "pb"
-  ),
-  both = list(
-    sig_col    = "both_sig",
-    fc_col     = "avg_log2FC_pb", 
-    title_desc = "both single cell and pseudo-bulk DE analysis",
-    out_folder = "both"
   )
 )
 
-# For each celltype run gsea for sc, pb and common DEGs
+# For each celltype run gsea for sc and pb DEGs 
 for (cell_type in unique(total_DEGs$celltype)) {
         
-        # Cytopus is cell type specific so it must be prepared for each celltype
-        cytopus_list <- c(cytopus_gene_sets[[cell_type]], cytopus_gene_sets[["global"]])
-        cytopus_list <- lapply(cytopus_list, function(x) {
-          as.character(unlist(x, use.names = FALSE))
-        })
-        
-        # Iterate over sc, pb, and both analyses
+        # Iterate over sc and pb analyses
         for (ana_name in names(analysis_configs)) {
+                
+                # Get configuration for the current analysis
                 cfg <- analysis_configs[[ana_name]]
                 
-                # Create rank for this celltype dynamically based on the configuration
+                # Create rank for this celltype based on the configuration
                 celltype_DEGs <- total_DEGs %>% 
-                  dplyr::filter(celltype == cell_type, .data[[cfg$sig_col]]) %>% 
-                  dplyr::arrange(desc(.data[[cfg$fc_col]]))
+                dplyr::filter(celltype == cell_type, !is.na(.data[[cfg$sig_col]])) %>% 
+                dplyr::arrange(desc(.data[[cfg$rank_col]]))
                 
-                rank        <- celltype_DEGs[[cfg$fc_col]]
+                rank        <- celltype_DEGs[[cfg$rank_col]]
                 names(rank) <- celltype_DEGs$gene
-                
+                rank        <- rank[!is.na(rank)]
                 for (gene_set in gene_sets_names) {
                         
                         set.seed(42)
@@ -1277,6 +1278,24 @@ for (cell_type in unique(total_DEGs$celltype)) {
                                 
                                 ggsave(p, filename = paste0(file_prefix, ".pdf"), device = "pdf", width = 12, height = 8, create.dir = TRUE)
                                 write_csv(sig_results, file = paste0(file_prefix, ".csv"))
+                                
+                                # clusterProfiler-style dotplot
+                                plot_data <- sig_results[pathway %in% top_pathways]
+                                
+                                # Convert pathway to a factor ordered by NES
+                                plot_data$pathway <- factor(plot_data$pathway, levels = plot_data$pathway[order(plot_data$NES)])
+                                
+                                p_cp_mimic <- ggplot(plot_data, aes(x = NES, y = pathway, color = padj, size = size)) +
+                                        geom_point() +
+                                        scale_color_gradient(low = "red", high = "blue", name = "p.adjust", guide = guide_colorbar(reverse = TRUE)) +
+                                        scale_size_continuous(range = c(3, 8), name = "Set Size") +
+                                        theme_minimal() +
+                                        labs(title = paste0("GSEA of DEGs according to ", cfg$title_desc, "\nfor ", cell_type, " cells using ", gene_set, " gene set."),
+                                             x = "Normalized Enrichment Score (NES)",
+                                             y = NULL) +
+                                        theme(axis.text.y = element_text(size = 10))
+                                
+                                ggsave(p_cp_mimic, filename = paste0(file_prefix, "_dotplot.pdf"), device = "pdf", width = 12, height = 8, create.dir = TRUE)
                         }
                 }
         }
@@ -1290,9 +1309,18 @@ for (cell_type in unique(total_DEGs$celltype)) {
 # Output path
 base_ora_path <- paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation, "_annotation/enrichment/ora/")
 
-analyses      <- c("sc", "pb", "both")
-class_columns <- list("sc"="class_sc", "pb"="class_pb", "both"="class_pb")
-sig_columns   <- list("sc"="is_sig_sc", "pb"="is_sig_pb", "both"="both_sig")
+analyses         <- c("sc", "pb", "both")
+class_columns    <- list("sc"="class_sc", "pb"="class_pb", "both"="class_pb")
+sig_columns      <- list("sc"="is_sig_sc", "pb"="is_sig_pb", "both"="both_sig")
+
+# Get all valid human gene symbols from the database
+valid_symbols <- AnnotationDbi::keys(org.Hs.eg.db, keytype = "SYMBOL")
+
+# Prepare background universe set (all genes that ahve been tested in DE analysis)
+universe_symbol <- rownames(data@assays$RNA@data)
+universe_symbol <- intersect(universe_symbol, valid_symbols)
+
+universe_entrez <- sig_entrez <- clusterProfiler::bitr(universe_symbol, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
 
 for (cell_type in unique(total_DEGs$celltype)) {
         
@@ -1310,14 +1338,12 @@ for (cell_type in unique(total_DEGs$celltype)) {
                 # Loop through both UP and DOWN directions
                 for (dir in c("UP", "DOWN")) {
                         
-                        # Extract significant DEGs for the current analysis type and direction dynamically
+                        # Extract significant DEGs for the current analysis type and direction
                         sig_genes <- total_DEGs %>% 
                                 dplyr::filter(.data[[sig_columns[[analysis]]]] == TRUE,
                                               .data[[class_columns[[analysis]]]] == dir,
                                               celltype == cell_type) %>% 
                                 dplyr::pull(gene)
-                        # Get all valid human gene symbols from the database
-                        valid_symbols <- AnnotationDbi::keys(org.Hs.eg.db, keytype = "SYMBOL")
                         
                         # Keep only the genes that actually exist in the database
                         mapped_genes <- intersect(sig_genes, valid_symbols)
@@ -1332,23 +1358,26 @@ for (cell_type in unique(total_DEGs$celltype)) {
                         ora_results <- list()
                         
                         # 1. Run ORA against GO
-                        ora_results[["GO"]] <- enrichGO(gene    = mapped_genes,
-                                                        OrgDb   = org.Hs.eg.db,
+                        ora_results[["GO"]] <- enrichGO(gene      = mapped_genes,
+                                                        OrgDb     = org.Hs.eg.db,
                                                         minGSSize = 5,
-                                                        keyType = "SYMBOL",
-                                                        ont     = "BP")
+                                                        universe  = universe_symbol,
+                                                        keyType   = "SYMBOL",
+                                                        ont       = "BP")
                         
                         # 2. Run ORA against REACTOME
                         if (nrow(sig_entrez) > 0) {
-                                ora_results[["REACTOME"]] <- enrichPathway(gene = sig_entrez$ENTREZID,
-                                                                           minGSSize = 5,
+                                ora_results[["REACTOME"]] <- enrichPathway(gene         = sig_entrez$ENTREZID,
+                                                                           minGSSize    = 5,
+                                                                           universe     = universe_entrez$ENTREZID,
                                                                            pvalueCutoff = 0.05,
-                                                                           readable = TRUE)
+                                                                           readable     = TRUE)
                         }
                         
                         # 3. Run ORA against Cytopus
                         ora_results[["CYTOPUS"]] <- enricher(mapped_genes,
                                                              minGSSize = 5,
+                                                             universe  = universe_symbol,
                                                              TERM2GENE = cytopus_term2gene)
                         
                         # Iterate over the completed results to validate, plot, and save
