@@ -666,7 +666,7 @@ IGP_activation_WMW_sample_agg <- IGP_activation_WMW_sample_agg %>%
   relocate(FDR, .after = p) %>%
   mutate(log2FC = log2(avg_activation_case / avg_activation_control))
 if(! dir.exists(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/"))){dir.create(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/"), recursive = TRUE)}
-write_csv(IGP_activation_WMW_sample_agg, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/IPG_activation_WMW_test_sample_aggregated.csv"))
+write_csv(IGP_activation_WMW_sample_agg, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/IGP_activation_WMW_test_sample_aggregated.csv"))
 ```
 
 ## Boxplots - facet
