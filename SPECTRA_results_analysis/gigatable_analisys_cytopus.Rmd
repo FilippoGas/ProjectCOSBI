@@ -2,7 +2,8 @@ Filippo Gastaldello - 17/03/2026
 
 ```{r}
 library(tidyverse)
-library(UpSetR)
+library(ComplexHeatmap)
+library(ggrepel)
 ```
 
 # Paths
@@ -24,9 +25,54 @@ FDR_padj_thresh         <- 0.05
 log2FC_lmm_phase_thresh <- 1
 ```
 
-# LMM-GSEA-ORA Intersection
+# LMM-GSEA-ORA
+
+## Intersection (UpSet plot)
 
 Check overlap in the lists of deregulated programs according to LMM, GSEA and ORA
+
+```{r}
+upset_data <- list(
+  LMM = gigatable %>% 
+    filter(FDR_lmm_phase<0.05,
+           abs(log2FC_lmm_phase)>1) %>% 
+    mutate(label = paste0(cell_type, "_", program_short)) %>% 
+    pull(label) %>% 
+    unique(),
+  
+  GSEA_sc = gigatable %>% 
+    filter(!is.na(padj_GSEA_sc)) %>% 
+    mutate(label = paste0(cell_type, "_", program_short)) %>% 
+    pull(label) %>% 
+    unique(),
+  
+  GSEA_pb = gigatable %>% 
+    filter(!is.na(padj_GSEA_pb)) %>% 
+    mutate(label = paste0(cell_type, "_", program_short)) %>% 
+    pull(label) %>% 
+    unique(),
+  
+  ORA_sc = gigatable %>% 
+    filter(!is.na(padj_ORA_UP_sc) | !is.na(padj_ORA_DOWN_sc)) %>% 
+    mutate(label = paste0(cell_type, "_", program_short)) %>% 
+    pull(label) %>% 
+    unique(),
+  
+  ORA_pb = gigatable %>% 
+    filter(!is.na(padj_ORA_UP_pb) | !is.na(padj_ORA_DOWN_pb)) %>% 
+    mutate(label = paste0(cell_type, "_", program_short)) %>% 
+    pull(label) %>% 
+    unique(),
+  
+  ORA_both = gigatable %>% 
+    filter(!is.na(padj_ORA_UP_both) | !is.na(padj_ORA_DOWN_both)) %>% 
+    mutate(label = paste0(cell_type, "_", program_short)) %>% 
+    pull(label) %>% 
+    unique()
+)
+```
+
+### Horizontal
 ```{r}
 upset_data <- list(
                 LMM = gigatable %>% 
@@ -35,42 +81,93 @@ upset_data <- list(
                         mutate(label = paste0(cell_type, "_", program_short)) %>% 
                         pull(label) %>% 
                         unique(),
-                
                 GSEA_sc = gigatable %>% 
                                 filter(!is.na(padj_GSEA_sc)) %>% 
                                 mutate(label = paste0(cell_type, "_", program_short)) %>% 
                                 pull(label) %>% 
                                 unique(),
-                
                 GSEA_pb = gigatable %>% 
                                 filter(!is.na(padj_GSEA_pb)) %>% 
                                 mutate(label = paste0(cell_type, "_", program_short)) %>% 
                                 pull(label) %>% 
                                 unique(),
-                
                 ORA_sc = gigatable %>% 
                                 filter(!is.na(padj_ORA_UP_sc) | !is.na(padj_ORA_DOWN_sc)) %>% 
                                 mutate(label = paste0(cell_type, "_", program_short)) %>% 
                                 pull(label) %>% 
                                 unique(),
-                
                 ORA_pb = gigatable %>% 
                                 filter(!is.na(padj_ORA_UP_pb) | !is.na(padj_ORA_DOWN_pb)) %>% 
                                 mutate(label = paste0(cell_type, "_", program_short)) %>% 
                                 pull(label) %>% 
                                 unique(),
-                
                 ORA_both = gigatable %>% 
                                 filter(!is.na(padj_ORA_UP_both) | !is.na(padj_ORA_DOWN_both)) %>% 
                                 mutate(label = paste0(cell_type, "_", program_short)) %>% 
                                 pull(label) %>% 
                                 unique()
+
 )
+
 # RUN THIS PART IN CONSOLE
 pdf(file = paste0(out_dir, "upset_LMM_GSEA_ORA.pdf"), width = 9, height = 5, onefile = FALSE)
 upset(fromList(upset_data),
       order.by = "freq",
       nsets = 6)
+dev.off()
+```
+
+```{r}
+m <- make_comb_mat(upset_data)
+m <- m[comb_degree(m) > 1] 
+
+m_transposed <- t(m)
+
+all_codes <- comb_name(m_transposed)
+all_sizes <- comb_size(m_transposed)
+all_degrees <- comb_degree(m_transposed) 
+
+lmm_index <- which(set_name(m_transposed) == "LMM")
+
+plot_order <- order(all_degrees, all_sizes, decreasing = TRUE)
+
+all_labels <- sapply(seq_along(all_codes), function(i) {
+  
+  includes_lmm <- substr(all_codes[i], lmm_index, lmm_index) == "1"
+  
+  if ((all_degrees[i] >= 3 && all_sizes[i] < 7) || includes_lmm) {
+    items <- extract_comb(m, all_codes[i])
+    return(paste(items, collapse = "\n"))
+  } else {
+    return("") 
+  }
+})
+
+combined_right_annotation <- rowAnnotation(
+  "Size" = anno_text(
+    as.character(all_sizes), 
+    just = "center", 
+    gp = gpar(fontsize = 10, fontface = "bold")
+  ),
+  "Items" = anno_text(
+    all_labels, 
+    just = "left", 
+    location = unit(0, "npc"), 
+    gp = gpar(fontsize = 8)
+  ),
+  gap = unit(4, "mm") 
+)
+
+pdf(file = paste0(out_dir, "upset_LMM_GSEA_ORA_vertical.pdf"), width = 11, height = 20, onefile = FALSE)
+
+draw(UpSet(
+  m_transposed, 
+  comb_order = plot_order,
+  right_annotation = combined_right_annotation,
+  column_names_side = "top",
+  column_names_rot  = 45
+))
+
 dev.off()
 ```
 
@@ -178,89 +275,250 @@ configs <- list(
                 )
 )
 
-plots <- lapply(names(configs), function(name){
+lapply(names(configs), function(name){
                 
-                conf <- configs[[name]]
-                
-                plot_data <- gigatable %>%
-                                filter(!is.na(.data[[conf$padj]])) %>% 
-                                dplyr::select(cell_type,
-                                              program_short,
-                                              FDR_lmm_phase,
-                                              log2FC_lmm_phase,
-                                              conf$padj,
-                                              conf$NES) %>% 
-                                mutate(concordant = case_when(
-                                                        sign(log2FC_lmm_phase) == sign(.data[[conf$NES]]) & sign(log2FC_lmm_phase) == -1 ~ "DOWN",
-                                                        sign(log2FC_lmm_phase) == sign(.data[[conf$NES]]) & sign(log2FC_lmm_phase) == 1  ~ "UP",
-                                                        TRUE                                                                             ~ "no"
-                                                        ),
-                                       LMM_sig    = ifelse(FDR_lmm_phase < FDR_padj_thresh, "yes", "no")
-                                       )
-                
-                p <- plot_data %>%
-                        ggplot(aes(x = .data[[conf$NES]], y = log2FC_lmm_phase, color = concordant, shape = LMM_sig)) +
-                                geom_point(size = 2) +
-                                scale_color_manual(
-                                        values  = c("UP" = "red", "DOWN" = "purple", "no" = "grey"),
-                                        breaks  = c("UP", "DOWN", "no"),
-                                        labels  = c("Both up", "Both down", "Discordant")
-                                        ) +
+        conf <- configs[[name]]
+        
+        plot_data <- gigatable %>%
+                        filter(!is.na(.data[[conf$padj]])) %>% 
+                        dplyr::select(cell_type,
+                                      program_short,
+                                      FDR_lmm_phase,
+                                      log2FC_lmm_phase,
+                                      conf$padj,
+                                      conf$NES) %>% 
+                        mutate(concordant = case_when(
+                                                sign(log2FC_lmm_phase) == sign(.data[[conf$NES]]) & sign(log2FC_lmm_phase) == -1 ~ "DOWN",
+                                                sign(log2FC_lmm_phase) == sign(.data[[conf$NES]]) & sign(log2FC_lmm_phase) == 1  ~ "UP",
+                                                TRUE                                                                             ~ "no"
+                                                ),
+                               LMM_sig    = ifelse(FDR_lmm_phase < FDR_padj_thresh, "yes", "no")
+                               )
+        
+        p <- plot_data %>%
+                ggplot(aes(x = .data[[conf$NES]], y = log2FC_lmm_phase, color = concordant, shape = LMM_sig)) +
+                        geom_point(size = 2) +
+                        scale_color_manual(
+                                values  = c("UP" = "red", "DOWN" = "purple", "no" = "grey"),
+                                breaks  = c("UP", "DOWN", "no"),
+                                labels  = c("Both up", "Both down", "Discordant")
+                                ) +
+                        scale_shape_manual(
+                                values = c("yes" = 16, "no" = 4),
+                                breaks = c("yes", "no")
+                                ) +
+                        geom_vline(
+                                xintercept = 0,
+                                col        = "black",
+                                linetype   = "dashed"
+                                ) +
+                        geom_hline(
+                                yintercept = 0,
+                                col        = "black",
+                                linetype   = "dashed"
+                                ) +
+                        labs(
+                                title = paste0("Enriched programs in GSEA analysis according to ", conf$title," DEGs"),
+                                color = "GSEA NES vs LMM FC sign",
+                                shape = "Significant (FDR<0.05) also in \nLMM analysis of Spectra scores"
+                                ) +
+                        xlab("Pseudobulk GSEA NES") +
+                        ylab("LMM log2(Activation FC)") +
+                        geom_label_repel(
+                                data               = plot_data %>% filter(!concordant == "no"),
+                                aes(label = paste0("(", cell_type, ")", " ", program_short)),
+                                size               = 2.5,           
+                                max.overlaps       = Inf,   
+                                box.padding        = 0.5,
+                                point.padding      = 0.2,
+                                min.segment.length = 0,
+                                nudge_x            = 0.15,
+                                nudge_y            = 0.5
+                                ) +
+                        theme_minimal()
+        
+        ggsave(plot       = p,
+               filename   = paste0(out_dir, "LMM-GSEA/GSEA_", name, "_scatter_LMM.pdf"),
+               device     = "pdf",
+               width      = 13,
+               height     = 10,
+               create.dir = TRUE)
+        write_csv(plot_data, paste0(out_dir, "LMM-GSEA/GSEA_", name, "_scatter_LMM_plot_data.csv"))
+})
+```
+
+# LMM-ORA
+## ORA to LMM
+
+Given programs enriched in ORA analysis, check if they are significantly altered according to LMM analysis of spectra scores, or if at least they have concordant sign
+```{r}
+configs <- list(
+                sc = list(
+                        padj_up        = "padj_ORA_UP_sc",
+                        padj_down      = "padj_ORA_DOWN_sc",
+                        generatio_up   = "GeneRatio_ORA_UP_sc",
+                        generatio_down = "GeneRatio_ORA_DOWN_sc",
+                        title          = "single cell"
+                ),
+                pb = list(
+                        padj_up        = "padj_ORA_UP_pb",
+                        padj_down      = "padj_ORA_DOWN_pb",
+                        generatio_up   = "GeneRatio_ORA_UP_pb",
+                        generatio_down = "GeneRatio_ORA_DOWN_pb",
+                        title          = "pseudobulk"
+                ),
+                both = list(
+                        padj_up        = "padj_ORA_UP_both",
+                        padj_down      = "padj_ORA_DOWN_both",
+                        generatio_up   = "GeneRatio_ORA_UP_both",
+                        generatio_down = "GeneRatio_ORA_DOWN_both",
+                        title          = "both single cell and pseudobulk"
+                )
+)
+
+lapply(names(configs), function(name){
+
+        conf <- configs[[name]]
+
+        plot_data <- gigatable %>% 
+                        filter(!is.na(.data[[conf$padj_up]]) | !is.na(.data[[conf$padj_down]])) %>% 
+                        filter(!is.na(log2FC_lmm_phase)) %>% 
+                        dplyr::select(cell_type,
+                                      program_short,
+                                      FDR_lmm_phase,
+                                      log2FC_lmm_phase,
+                                      conf$padj_down,
+                                      conf$generatio_down,
+                                      conf$padj_up,
+                                      conf$generatio_up) %>% 
+                        mutate(!!conf$generatio_down := .data[[conf$generatio_down]] * -1) %>%  # Flip sign of gene ratio for down regulated programs to plot in negative quadrant
+                                                                                                # '!!' evaluate the content of the variable 'conf$generatio_down' and use it as columns name
+                                                                                                # ':=' allows the assignment to a dynamic evaluation
+                        mutate(up_concordant   = ifelse(!is.na(.data[[conf$padj_up]]) & sign(log2FC_lmm_phase) == 1, "yes","no"),
+                               up_concordant   = ifelse(is.na(up_concordant), "no", up_concordant),
+                               down_concordant = ifelse(!is.na(.data[[conf$padj_down]]) & sign(log2FC_lmm_phase) == -1, "yes", "no"),
+                               down_concordant = ifelse(is.na(down_concordant), "no", down_concordant),
+                               lmm_sig         = case_when(
+                                                        FDR_lmm_phase < FDR_padj_thresh    ~ "yes",
+                                                        TRUE                    ~ "no"
+                               ))
+        # Transform the data first
+        plot_data_long <- plot_data %>%
+          # Combine UP and DOWN generatio into one X-axis column
+          pivot_longer(cols = c(conf$generatio_up, conf$generatio_down),
+                       names_to = "ora_direction",
+                       values_to = "generatio") %>%
+          mutate(concordance_status = case_when(
+                  ora_direction == conf$generatio_up & up_concordant == "yes" ~ "UP_yes",
+                  ora_direction == conf$generatio_down & down_concordant == "yes" ~ "DOWN_yes",
+                  TRUE ~ "no"))
+
+        # Plot with a single geom_point and a single color scale
+        p <- plot_data_long %>% ggplot(aes(x = generatio, y = log2FC_lmm_phase, shape = lmm_sig, color = concordance_status)) +
+                                geom_point() +
                                 scale_shape_manual(
-                                        values = c("yes" = 16, "no" = 4),
-                                        breaks = c("yes", "no")
+                                        values = c("yes" = 16, "no" = 4)
                                         ) +
-                                geom_vline(
-                                        xintercept = 0,
-                                        col        = "black",
-                                        linetype   = "dashed"
+                                scale_color_manual(
+                                        name   = "Concordance",
+                                        values = c("UP_yes" = "red", "DOWN_yes" = "purple", "no" = "grey"),
+                                        labels = c("UP_yes" = "UP Concordant", "DOWN_yes" = "DOWN Concordant", "no" = "Not Concordant")
                                         ) +
                                 geom_hline(
                                         yintercept = 0,
-                                        col        = "black",
-                                        linetype   = "dashed"
+                                        col = "black",
+                                        linetype = "dashed"
+                                        ) +
+                                geom_vline(
+                                        xintercept = 0,
+                                        col = "black",
+                                        linetype = "dashed"
                                         ) +
                                 labs(
-                                        title = paste0("Enriched programs in GSEA analysis according to ", conf$title," DEGs "),
-                                        color = "GSEA NES vs LMM FC sign",
-                                        shape = "Significant (FDR<0.05) also in \nLMM analysis of Spectra scores"
+                                        title = paste0("Enriched programs in ORA analysis according to ", conf$title," DEGs"),
+                                        shape = "Also significant (FDR < 0.05)\nin LMM analysis"
                                         ) +
-                                xlab("Pseudobulk GSEA NES") +
+                                xlab("ORA gene ratio") +
                                 ylab("LMM log2(Activation FC)") +
                                 geom_label_repel(
-                                        data               = plot_data %>% filter(!concordant == "no"),
+                                        data               = plot_data_long %>% filter(!concordance_status == "no" & lmm_sig == "yes"),
                                         aes(label = paste0("(", cell_type, ")", " ", program_short)),
                                         size               = 2.5,           
                                         max.overlaps       = Inf,   
                                         box.padding        = 0.5,
                                         point.padding      = 0.2,
                                         min.segment.length = 0,
-                                        nudge_x            = .15,
-                                        nudge_y            = .5
+                                        nudge_x            = 0.15,
+                                        nudge_y            = 0.5
                                         ) +
                                 theme_minimal()
-                
-                ggsave(plot = p,
-                       filename = paste0(out_dir, "LMM-GSEA/GSEA_", name, "_scatter_LMM.pdf"),
-                       device = "pdf",
-                       width = 13,
-                       height = 10,
-                       create.dir = TRUE)
-                write_csv(plot_data, paste0(out_dir, "LMM-GSEA/GSEA_", name, "_scatter_LMM_plot_data.csv"))
+        ggsave(plot = p,
+               filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation/methods_comparison/LMM-ORA/ORA_", name, "_scatter_LMM.pdf"),
+               width = 10,
+               height = 7,
+               device = "pdf",
+               create.dir = TRUE)
 })
-
-
-
 ```
 
-# LMM-ORA
-## LMM to ORA
+# BIOLOGICAL RELEVANCE
 
-Volcano plot of program activation (SPECTRA scores) according to LMM, with information about significance in ORA analysis.
+Compute distributions of relevance scores (final_score) from the MAGIC REPORT (cytopus_ipf_full_program_scores.json) between deregulations detected with SPECTRA vs DEA.
 ```{r}
-plot_data <- gigatable %>% 
-                filter(FDR_lmm_phase <- 0.05) %>% 
-                select(cell_type,
-                       program_short)
+# Load program scores, used to compute biological relevance
+program_scores_IPF <- read_tsv("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/resources/cytopus_relevance_IPF/cytopus_ipf/cytopus_ipf_full_program_scores.tsv")
+
+DEA_cols  <- colnames(gigatable)[grepl("GSEA", colnames(gigatable)) | grepl("ORA", colnames(gigatable))]
+to_select <- c("cell_type", "program_short")
+
+# Extract celltype-program deregulations detected by SPECTRA, DEA abd both
+programs_spectra <- gigatable %>% 
+                        filter(FDR_lmm_phase < FDR_padj_thresh, abs(log2FC_lmm_phase) > log2FC_lmm_phase_thresh,            # Significant in LMM
+                               if_all(DEA_cols, is.na)) %>%                                                                 # Not significant in any DEA method
+                        dplyr::select(all_of(to_select)) %>% 
+                        unique() %>% 
+                        left_join(program_scores_IPF %>%
+                                        dplyr::select(program_name,
+                                                      final_score),
+                                  by = join_by("program_short" == "program_name")) %>% 
+                        mutate(analysis = "Spectra")
+programs_dea     <- gigatable %>% 
+                        filter(!if_all(DEA_cols, is.na),                                                                    # Significant in at least one DEA method
+                               !(FDR_lmm_phase < FDR_padj_thresh & abs(log2FC_lmm_phase) > log2FC_lmm_phase_thresh)) %>%    # Not significant in LMM
+                        dplyr::select(all_of(to_select)) %>% 
+                        unique() %>% 
+                        left_join(program_scores_IPF %>%
+                                        dplyr::select(program_name,
+                                                      final_score),
+                                  by = join_by("program_short" == "program_name")) %>% 
+                        mutate(analysis = "DEA")
+programs_both    <- gigatable %>% 
+                        filter(!if_all(DEA_cols, is.na),                                                                    # Significant in at least one DEA method
+                               FDR_lmm_phase < FDR_padj_thresh & abs(log2FC_lmm_phase) > log2FC_lmm_phase_thresh) %>%       # Significant in LMM
+                        dplyr::select(all_of(to_select)) %>% 
+                        unique() %>% 
+                        left_join(program_scores_IPF %>%
+                                        dplyr::select(program_name,
+                                                      final_score),
+                                  by = join_by("program_short" == "program_name")) %>% 
+                        mutate(analysis = "Both")
+
+plot_data <- bind_rows(list(programs_spectra, programs_dea, programs_both))
+
+p <- plot_data %>% ggplot(aes(x = analysis, y = final_score)) +
+                        geom_boxplot(outliers = FALSE) +      # Not showing outliers since datapoints are shown
+                        geom_jitter() +
+                        ggtitle("Biological relevance in IPF (final_score from cytopus relevance report) in programs found deregulated only by Spectra, only by DEA methods (any) or both.") +
+                        ylab("Relevance score") +
+                        theme_minimal()
+
+ggsave(plot       = p,
+       filename   = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation/methods_comparison/biological_relevace/SPECTRA_vs_DEA_vs_both.pdf",
+       device     = "pdf",
+       create.dir = TRUE,
+       width      = 8,
+       height     = 5)
+
 ```
+
 
