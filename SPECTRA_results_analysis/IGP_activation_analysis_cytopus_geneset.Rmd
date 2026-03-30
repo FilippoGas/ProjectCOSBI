@@ -23,6 +23,7 @@ library(org.Hs.eg.db)
 library(DOSE)
 library(ReactomePA)
 library(enrichplot)
+library(effectsize)
 ```
 
 # Data loading and preprocess
@@ -568,7 +569,7 @@ Test IGP activation differences in case vs control for each cell type aggregatin
 
 ```{r}
 res_WMW_sample_agg <- lapply(unique(cell_scores$annotation), function(cell_type){
-  
+        
         # Subset cell scores to keep only current cell type
         celltype_cell_score <- cell_scores %>% dplyr::filter(annotation == cell_type)
         
@@ -576,7 +577,6 @@ res_WMW_sample_agg <- lapply(unique(cell_scores$annotation), function(cell_type)
         n_total_control <- sum(celltype_cell_score$Diagnosis == "Control")
         n_total_ipf     <- sum(celltype_cell_score$Diagnosis == "IPF")
         
-        # Use a list to store loop results
         tests_list <- list()
         
         programs <- colnames(celltype_cell_score)[6:length(colnames(celltype_cell_score))]
@@ -598,35 +598,57 @@ res_WMW_sample_agg <- lapply(unique(cell_scores$annotation), function(cell_type)
                 perc_active_case    <- round((n_active_case / n_total_ipf) * 100, 2)
                 
                 # Aggregate cell scores per sample
-                vec_control <- vec_control %>% summarise(.by = Sample_Name, mean(.data[[program]]))
-                vec_ipf     <- vec_ipf     %>% summarize(.by = Sample_Name, mean(.data[[program]]))
+                vec_control_agg <- vec_control %>% summarise(.by = Sample_Name, score = mean(.data[[program]]))
+                vec_ipf_agg     <- vec_ipf     %>% summarise(.by = Sample_Name, score = mean(.data[[program]]))
                 
-                colnames(vec_control) <- c("Sample_Name", "score")
-                colnames(vec_ipf) <- c("Sample_Name", "score")
+                # Extract the numeric vectors for the test
+                scores_control <- vec_control_agg %>% pull(score)
+                scores_ipf     <- vec_ipf_agg %>% pull(score)
                 
                 # Try to compute the test
-                test_res <- try(wilcox.test(x = vec_control %>% pull(score), y = vec_ipf %>% pull(score), paired = FALSE), silent = TRUE)
+                test_res <- try(wilcox.test(x          = scores_control,
+                                            y          = scores_ipf,
+                                            conf.int   = TRUE,
+                                            paired     = FALSE),
+                                silent = TRUE)
                 
-                if (inherits(test_res, "try-error")) {
-                        stat <- NA
-                        pval <- NA
-                }else{
+                if (inherits(test_res, "try-error") || length(scores_control) == 0 || length(scores_ipf) == 0) {
+                        stat       <- NA
+                        pval       <- NA
+                        es         <- NA
+                        es_ci_low  <- NA
+                        es_ci_high <- NA
+                } else {
                         stat <- test_res$statistic
                         pval <- test_res$p.value
+                        
+                        # Compute effect size and 95% CI on the sample-aggregated data
+                        es_res <- effectsize::rank_biserial(x = scores_ipf, 
+                                                            y = scores_control,  # The second group is used as reference by default 
+                                                            ci = 0.95)
+                        
+                        es         <- es_res$r_rank_biserial
+                        es_ci_low  <- es_res$CI_low
+                        es_ci_high <- es_res$CI_high
                 }
                 
-                # Store results, including the active sample sizes
+                # Store results
                 tests_list[[program]] <- data.frame(
-                                                cell_type                 = cell_type, 
-                                                program                   = program, 
-                                                active_cells_control_perc = perc_active_control,
-                                                active_cells_case_perc    = perc_active_case, 
-                                                n_active_control          = n_active_control, 
-                                                n_active_case             = n_active_case,
-                                                avg_activation_control    = mean(vec_control %>% pull(score)),
-                                                avg_activation_case       = mean(vec_ipf %>% pull(score)),
-                                                statistic                 = stat, 
-                                                p                         = pval
+                                        cell_type                 = cell_type, 
+                                        program                   = program, 
+                                        active_cells_control_perc = perc_active_control,
+                                        active_cells_case_perc    = perc_active_case, 
+                                        n_active_control          = n_active_control, 
+                                        n_active_case             = n_active_case,
+                                        n_samples_control         = length(scores_control),
+                                        n_samples_case            = length(scores_ipf),
+                                        avg_activation_control    = mean(scores_control),
+                                        avg_activation_case       = mean(scores_ipf),
+                                        statistic                 = stat, 
+                                        p                         = pval,
+                                        effect_size               = es,
+                                        effect_size_CI_lower      = es_ci_low,
+                                        effect_size_CI_upper      = es_ci_high
                 )
         }
         return(bind_rows(tests_list))
@@ -635,18 +657,14 @@ res_WMW_sample_agg <- lapply(unique(cell_scores$annotation), function(cell_type)
 # Bind all cell types together
 IGP_activation_WMW_sample_agg <- bind_rows(res_WMW_sample_agg)
 
-# Compute FDR and Effect Size
+# Compute FDR and log2FC (Removed manual effect size math)
 IGP_activation_WMW_sample_agg <- IGP_activation_WMW_sample_agg %>%
   drop_na(p) %>% 
   group_by(cell_type) %>% 
   mutate(FDR = p.adjust(p, method = "fdr")) %>% 
   ungroup() %>% 
   relocate(FDR, .after = p) %>%
-  # Apply the Rank Biserial Formula to compute effect size
-  mutate(effect_size           = abs(1 - (2 * statistic) / (n_active_control * n_active_case)),
-         log2FC                = log2(avg_activation_case/avg_activation_control),
-         effect_size_direction = effect_size*sign(log2FC))
-
+  mutate(log2FC = log2(avg_activation_case / avg_activation_control))
 if(! dir.exists(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/"))){dir.create(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/"), recursive = TRUE)}
 write_csv(IGP_activation_WMW_sample_agg, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/IPG_activation_WMW_test_sample_aggregated.csv"))
 ```
@@ -657,7 +675,7 @@ Plot activation values in case vs control, only in comparisons where the differe
 
 ```{r}
 # Extract significant tests
-WMW_sample_agg_sig <- IGP_activation_WMW_sample_agg %>% dplyr::filter(FDR <0.05 & (effect_size > 0.3))
+WMW_sample_agg_sig <- IGP_activation_WMW_sample_agg %>% dplyr::filter(FDR <0.05 & (abs(effect_size) > 0.3))
 
 plot_data <- cell_scores %>%
                 pivot_longer(6:length(colnames(cell_scores)), names_to = "program") %>%                           # Flatten cell_scores for plotting
@@ -726,6 +744,54 @@ for (celltype in unique(plot_data$annotation)) {
         
         ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation,"_annotation/wilcoxon_test_sample_aggregated/boxplots_DAP/boxplot_wilcoxon_significant_", gsub("/", "_", celltype),".pdf"), plot = p, device = "pdf", width = 12, height = 8, create.dir = TRUE)
 }
+```
+
+## Volcano plot FDR vs effect size
+```{r}
+plot_data <- IGP_activation_WMW_sample_agg %>% 
+                mutate(label = paste0("(", cell_type, ") ", str_split_i(program, "-X-", 3)),
+                       sig = case_when(
+                               FDR <= 0.05 & effect_size >= 0.5                      ~ "up_high",
+                               FDR <= 0.05 & effect_size >=0.3 & effect_size < 0.5   ~ "up_mid",
+                               FDR <= 0.05 & effect_size <= -0.5                     ~ "down_high",
+                               FDR <= 0.05 & effect_size <= -0.3 & effect_size> -0.5 ~ "down_mid",
+                               TRUE                                    ~ "no_sig"
+                       )) %>%
+                dplyr::select(label,
+                              FDR,
+                              effect_size,
+                              sig)
+
+p <- plot_data %>% ggplot(aes(x = effect_size, y = -log10(FDR), color = sig)) +
+                        geom_point() +
+                        scale_color_manual(
+                                values = c("up_high" = "#f00514", "up_mid" = "#d19f9f", "down_high" = "#6e02e0", "down_mid" = "#b6a9c9", "no_sig" = "#d4d4d4"),
+                                breaks = c("down_high", "down_mid", "up_high", "up_mid"),
+                                labels = c("Over activated - High confidence", "Over activated - Moderate confidence","Repressed - High confidence", "Repressed - Moderate confidence")
+                                ) +
+                        geom_label_repel(
+                                data = plot_data %>% filter(sig == "up_high" | sig == "down_high"),
+                                aes(label = label),
+                                size = 2.5,           
+                                max.overlaps = Inf,   
+                                box.padding = 0.5,
+                                point.padding = 0.2,
+                                min.segment.length = 0,
+                                nudge_x = .15,
+                                nudge_y = .5,
+                                ) +
+                        labs(
+                                title    = "Deregulated programs activations according to Spectra scores",
+                                subtitle = "Wilcoxon unpaired test on sample aggregated scores per cell type.",
+                                color    = "Deregulation effect"
+                                ) +
+                        theme_minimal()
+ggsave(plot = p,
+       filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation/wilcoxon_test_sample_aggregated/volcano_FDR_effect_size.pdf",
+       create.dir = TRUE,
+       height = 9,
+       width = 13,
+       device = "pdf")
 ```
 
 # Wilcoxon-Mann-Whitney test (expression)
