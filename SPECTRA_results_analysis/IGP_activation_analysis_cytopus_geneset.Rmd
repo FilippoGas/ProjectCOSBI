@@ -399,9 +399,6 @@ ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/d
 Test IGP activation differences in case vs control, for each cell type
 
 ```{r}
-library(dplyr)
-library(tidyr)
-
 res_WMW <- lapply(unique(cell_scores$annotation), function(cell_type){
   
         # Subset cell scores to keep only current cell type
@@ -473,7 +470,7 @@ write_csv(IGP_activation_WMW, file = paste0("/shares/CIBIO-Storage/BCG/scratch/f
 
 ## Boxplots - facet
 
-Plot activation values in case vs control, only in comparisons where the difference is significant according to the Welch test
+Plot activation values in case vs control, only in comparisons where the difference is significant
 
 ```{r}
 # Extract significant tests
@@ -564,6 +561,173 @@ p <- plot_data %>% ggplot(aes(x=effect_size, y=-log10(FDR), color = effect)) +
 p
 ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/scatterplot_wilcoxon_DAP.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
 ```
+
+# Wilcoxon-Mann-Whitney test (DAP, sample aggregated)
+
+Test IGP activation differences in case vs control for each cell type aggregating score at sample level
+
+```{r}
+res_WMW_sample_agg <- lapply(unique(cell_scores$annotation), function(cell_type){
+  
+        # Subset cell scores to keep only current cell type
+        celltype_cell_score <- cell_scores %>% dplyr::filter(annotation == cell_type)
+        
+        # Store total cells for percentages
+        n_total_control <- sum(celltype_cell_score$Diagnosis == "Control")
+        n_total_ipf     <- sum(celltype_cell_score$Diagnosis == "IPF")
+        
+        # Use a list to store loop results
+        tests_list <- list()
+        
+        programs <- colnames(celltype_cell_score)[6:length(colnames(celltype_cell_score))]
+        
+        for (program in programs) {
+        
+                # Extract active cells
+                vec_control <- celltype_cell_score %>% 
+                                        dplyr::filter(Diagnosis == "Control" & .[[program]] > 0.001) %>%
+                                        dplyr::select(all_of(program), Sample_Name)
+                vec_ipf     <- celltype_cell_score %>%
+                                        dplyr::filter(Diagnosis == "IPF" & .[[program]] > 0.001) %>%
+                                        dplyr::select(all_of(program), Sample_Name)
+                
+                n_active_control <- nrow(vec_control)
+                n_active_case    <- nrow(vec_ipf)
+                
+                perc_active_control <- round((n_active_control / n_total_control) * 100, 2)
+                perc_active_case    <- round((n_active_case / n_total_ipf) * 100, 2)
+                
+                # Aggregate cell scores per sample
+                vec_control <- vec_control %>% summarise(.by = Sample_Name, mean(.data[[program]]))
+                vec_ipf     <- vec_ipf     %>% summarize(.by = Sample_Name, mean(.data[[program]]))
+                
+                colnames(vec_control) <- c("Sample_Name", "score")
+                colnames(vec_ipf) <- c("Sample_Name", "score")
+                
+                # Try to compute the test
+                test_res <- try(wilcox.test(x = vec_control %>% pull(score), y = vec_ipf %>% pull(score), paired = FALSE), silent = TRUE)
+                
+                if (inherits(test_res, "try-error")) {
+                        stat <- NA
+                        pval <- NA
+                }else{
+                        stat <- test_res$statistic
+                        pval <- test_res$p.value
+                }
+                
+                # Store results, including the active sample sizes
+                tests_list[[program]] <- data.frame(
+                                                cell_type                 = cell_type, 
+                                                program                   = program, 
+                                                active_cells_control_perc = perc_active_control,
+                                                active_cells_case_perc    = perc_active_case, 
+                                                n_active_control          = n_active_control, 
+                                                n_active_case             = n_active_case,
+                                                avg_activation_control    = mean(vec_control %>% pull(score)),
+                                                avg_activation_case       = mean(vec_ipf %>% pull(score)),
+                                                statistic                 = stat, 
+                                                p                         = pval
+                )
+        }
+        return(bind_rows(tests_list))
+})
+
+# Bind all cell types together
+IGP_activation_WMW_sample_agg <- bind_rows(res_WMW_sample_agg)
+
+# Compute FDR and Effect Size
+IGP_activation_WMW_sample_agg <- IGP_activation_WMW_sample_agg %>%
+  drop_na(p) %>% 
+  group_by(cell_type) %>% 
+  mutate(FDR = p.adjust(p, method = "fdr")) %>% 
+  ungroup() %>% 
+  relocate(FDR, .after = p) %>%
+  # Apply the Rank Biserial Formula to compute effect size
+  mutate(effect_size           = abs(1 - (2 * statistic) / (n_active_control * n_active_case)),
+         log2FC                = log2(avg_activation_case/avg_activation_control),
+         effect_size_direction = effect_size*sign(log2FC))
+
+if(! dir.exists(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/"))){dir.create(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/"), recursive = TRUE)}
+write_csv(IGP_activation_WMW_sample_agg, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/IPG_activation_WMW_test_sample_aggregated.csv"))
+```
+
+## Boxplots - facet
+
+Plot activation values in case vs control, only in comparisons where the difference is significant
+
+```{r}
+# Extract significant tests
+WMW_sample_agg_sig <- IGP_activation_WMW_sample_agg %>% dplyr::filter(FDR <0.05 & (effect_size > 0.3))
+
+plot_data <- cell_scores %>%
+                pivot_longer(6:length(colnames(cell_scores)), names_to = "program") %>%                           # Flatten cell_scores for plotting
+                filter(value > 0.001) %>%                                                                         # Only keep active cells
+                group_by(Sample_Name, annotation, program, Diagnosis) %>% 
+                summarize(value = mean(value)) %>%                                                                # Aggregate activation score per sample, for each cell type
+                ungroup() %>% 
+                inner_join(WMW_sample_agg_sig %>%                                                                 # Only keep significant de-regulations
+                                   dplyr::select(cell_type, program, FDR),
+                           by = join_by("annotation" == "cell_type", "program" == "program"))
+
+p <- plot_data %>% ggplot(aes(x=program, y=value, fill=Diagnosis))+
+                geom_boxplot() +
+                theme_minimal() +
+                theme(
+                        axis.text.x = element_text(hjust=1, angle = 45, size = 5)
+                ) +
+                facet_wrap(~annotation, scale="free")
+
+ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/boxplots_DAP/boxplot_wilcoxon_significant_facet_celltype.pdf"), plot = p, device = "pdf", width = 18, height = 15, create.dir = TRUE)
+```
+## Boxplot - per celltype
+
+```{r}
+for (celltype in unique(plot_data$annotation)) {
+        
+        p <- plot_data %>%
+                dplyr::filter(annotation==celltype) %>%
+                ggplot(aes(x=program, y=value, fill=Diagnosis)) +
+                        geom_boxplot(
+                                outliers = FALSE
+                        ) +
+                        geom_jitter(
+                                position = position_jitterdodge(),
+                                alpha    = 0.5,
+                                size     = 0.7
+                                ) +
+                        labs(
+                                title = paste0("IGP with significant differences in activation between case and control in ",celltype," cells."),
+                                y = "Activation level"
+                                ) +
+                        stat_compare_means(
+                                aes(group = Diagnosis),
+                                method = "wilcox.test",
+                                method.args = list(paired=FALSE),
+                                vjust = -1,
+                                label = "p.signif"
+                                ) +
+                        stat_summary(
+                            fun.data = function(y) {
+                              return(data.frame(
+                                y = max(y),
+                                label = paste0("n= ",length(y))
+                              ))
+                            },
+                            geom = "text",
+                            position = position_dodge(width = 0.75),
+                            vjust = -0.5,
+                            size = 3
+                          ) +
+                        theme_minimal() +
+                        theme(
+                                axis.text.x = element_text(hjust=1, angle=45, size=8)
+                                )
+                                                                                        
+        
+        ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation,"_annotation/wilcoxon_test_sample_aggregated/boxplots_DAP/boxplot_wilcoxon_significant_", gsub("/", "_", celltype),".pdf"), plot = p, device = "pdf", width = 12, height = 8, create.dir = TRUE)
+}
+```
+
 # Wilcoxon-Mann-Whitney test (expression)
 
 Test for differences in gene expression, per cell-type, per program
