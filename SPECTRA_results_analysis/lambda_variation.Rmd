@@ -1,0 +1,175 @@
+---
+author: Filippo Gastaldello
+title: "lambda_variation"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+```
+
+
+Check results at different values of lambda (Spectra parameter)
+
+# Paths and params
+```{r}
+# params
+lambdas <- c("0.5", "0.1", "0.01", "0.001")
+
+# paths
+gigatables_paths <- paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation_lam_",lambdas,"/gigatable.csv")
+output_dir       <- "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/lambda_analysis/"
+```
+
+# Read gigatables
+```{r message=FALSE}
+gigatables <- lapply(gigatables_paths, read_csv)
+names(gigatables) <- lambdas
+```
+
+# Number of concordant programs
+
+Check the number of concordant programs at different values of lambda. Programs are concordant if they are significant according to the Welch test with sample aggregated data (method from paper) and at least one of the GSEA analysis.
+```{r}
+res <- lapply(lambdas, function(lam){
+        # Extract the gigatable for the current lambda
+        gigatable <- gigatables[[lam]]
+        # Count concordant programs
+        concordant_programs_count <- gigatable %>%
+                                        filter(effect_size_wmw_activation_sample_agg >= 0.3 & FDR_wmw_activation_sample_agg <= 0.05,
+                                               if_any(c("padj_GSEA_sc", "padj_GSEA_pb"), ~ . <= 0.05)) %>% 
+                                        nrow()
+        return(data_frame("lambda" = lam, "count" = concordant_programs_count))
+})
+concordant_programs <- bind_rows(res)
+
+p <- concordant_programs %>% ggplot(aes(x = lambda, y = count)) +
+                                geom_bar(
+                                        stat  = "identity",
+                                        fill  = "orange",
+                                        width = 0.4
+                                        ) +
+                                geom_text(
+                                        aes(label = count),
+                                        vjust = -1
+                                        ) +
+                                ylim(
+                                        c(0, max(concordant_programs$count)+1)
+                                        ) +
+                                theme_minimal() +
+                                theme(
+                                        axis.text.y = element_blank()
+                                        ) +
+                                ggtitle(
+                                        "Number of concordant programs between Spectra based and GSEA methods"
+                                )
+p
+ggsave(filename = paste0(output_dir, "concordant_programs.pdf"),
+       plot = p,
+       width = 7,
+       height = 4,
+       create.dir = TRUE)
+```
+
+# Number of deregulated progragms
+
+Plot the number of deregulated program according to different methods
+```{r}
+res <- lapply(lambdas, function(lam){
+        gigatable <- gigatables[[lam]]
+        return(data_frame("lambda" = lam,
+                          "count"  = gigatable %>% filter(effect_size_wmw_activation_sample_agg>=0.3 & FDR_wmw_activation_sample_agg<=0.05) %>% nrow()
+                          )
+               )
+})
+deregulated_programs <- bind_rows(res)
+p <- deregulated_programs %>% ggplot(aes(x = lambda, y = count)) +
+                                geom_bar(
+                                        stat  = "identity",
+                                        fill  = "orange",
+                                        width = 0.4
+                                        ) +
+                                geom_text(
+                                        aes(label = count),
+                                        vjust = -1
+                                        ) +
+                                ylim(
+                                        c(0, max(deregulated_programs$count)+2)
+                                        ) +
+                                theme_minimal() +
+                                theme(
+                                        axis.text.y = element_blank()
+                                        ) +
+                                ggtitle(
+                                        "Number of deregulated programs according to WMW sample aggregated"
+                                )
+p
+ggsave(filename = paste0(output_dir, "deregulated_programs.pdf"),
+       plot = p,
+       width = 7,
+       height = 4,
+       create.dir = TRUE)
+```
+
+# Deregulation of critical programs at different values of lambda
+```{r}
+programs_of_interest <- c("fibro_TGFB1_response",
+                          "M_mac_CSF1_response",
+                          "fibro_EGF_response",
+                          "lung-epi_TGFB1_response",
+                          "all_MYC_targets",
+                          "all_hypoxia-response",
+                          "Mac_IL4-IL13_response",
+                          "lung-epi_IL13_response",
+                          "fibro_IL1B_response")
+
+res <- lapply(lambdas, function(lam){
+        
+        gigatable <- gigatables[[lam]]
+        # Which of the programs of interest are deregulated in WMW sample agg for this lambda?
+        gigatable <- gigatable %>% 
+                        filter(program_short %in% programs_of_interest,
+                               FDR_wmw_activation_sample_agg<=0.05,
+                               effect_size_wmw_activation_sample_agg>=0.3)
+        
+        df           <- data.frame(matrix(nrow = 0, ncol = 1+length(programs_of_interest)))
+        colnames(df) <- c("lambda", programs_of_interest)
+        df[1,1]      <- lam
+        
+        for (prog in unique(gigatable$program_short)) {
+                df[1,prog] <- gigatable %>% filter(program_short==prog) %>% pull(cell_type) %>% paste(collapse = "\n")
+        }
+        return(df)
+})
+key_program_deregulation <- bind_rows(res)
+
+p <- key_program_deregulation %>% 
+        pivot_longer(cols = colnames(key_program_deregulation)[-1],
+                     names_to = "program") %>% 
+        rowwise() %>% 
+        mutate(deregulations = length(str_split(value, ",")[[1]])) %>% 
+        ungroup() %>% 
+        mutate(deregulations = ifelse(is.na(value),0,deregulations)) %>% 
+                ggplot(aes(x = lambda, y = program, fill = deregulations)) +
+                        geom_tile() +
+                        geom_text(
+                                aes(label = value),
+                                size = 3
+                                ) +
+                        scale_fill_gradient(
+                                low   = "white",
+                                high  = "orange",
+                                guide = "none"
+                                ) +
+                        ggtitle(
+                                "Program deregulation across different lambda values"
+                                ) +
+                        theme_minimal()
+p
+ggsave(filename = paste0(output_dir, "key_programs_deregulation.pdf"),
+       plot = p,
+       width = 14,
+       height = 13,
+       create.dir = TRUE)
+```
+

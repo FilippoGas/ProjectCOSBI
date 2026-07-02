@@ -8,25 +8,26 @@ library(jsonlite)
 library(readxl)
 
 genesets            <- c("CYTOPUS")
-
 genesets_json_path  <- list("CYTOPUS"="/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/resources/genesets/Cytopus_unlisted_genesets.json")
 program_name_column <- list("CYTOPUS"="program_short")
-
 program_description <- read_excel("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cytopus_gene_sets/cytopus_genesets_description.xlsx", sheet = 1)
+
+lam                 <- "_lam_0.5"
 
 for (geneset_name in genesets) {
         
         # Load all result tables only keeping FDR and log2FC/effect size
         
         # LMM
-        lmm_patient       <- read_csv(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/",tolower(geneset_name),"_genesets/manual_annotation/lmm/IPG_activation_lmm.csv")) %>% dplyr::select(cell_type, program, FDR, log2FC) %>% mutate(cell_type = gsub("/","_", cell_type))
-        lmm_patient_phase <- read_csv(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/",tolower(geneset_name),"_genesets/manual_annotation/lmm/IPG_activation_lmm_phase_corrected.csv")) %>% dplyr::filter(term == "DiagnosisIPF") %>%  dplyr::select(cell_type, program, FDR, log2FC) %>% mutate(cell_type = gsub("/","_", cell_type))
+        lmm_patient       <- read_csv(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/",tolower(geneset_name),"_genesets/manual_annotation",lam,"/lmm/IPG_activation_lmm.csv")) %>% dplyr::select(cell_type, program, FDR, log2FC) %>% mutate(cell_type = gsub("/","_", cell_type))
+        lmm_patient_phase <- read_csv(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/",tolower(geneset_name),"_genesets/manual_annotation",lam,"/lmm/IPG_activation_lmm_phase_corrected.csv")) %>% dplyr::filter(term == "DiagnosisIPF") %>%  dplyr::select(cell_type, program, FDR, log2FC) %>% mutate(cell_type = gsub("/","_", cell_type))
         # Welch
-        welch_activation  <- read_csv(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/",tolower(geneset_name),"_genesets/manual_annotation/welch_test/IPG_activation_welch_test.csv")) %>% dplyr::select(cell_type, program, FDR, log2FC) %>% mutate(cell_type = gsub("/","_", cell_type))
-        welch_expression  <- read_csv(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/",tolower(geneset_name),"_genesets/manual_annotation/welch_test/IPG_expression_welch_test.csv")) %>% dplyr::select(cell_type, program, FDR, log2FC) %>% mutate(cell_type = gsub("/","_", cell_type))
+        welch_activation  <- read_csv(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/",tolower(geneset_name),"_genesets/manual_annotation",lam,"/welch_test/IPG_activation_welch_test.csv")) %>% dplyr::select(cell_type, program, FDR, log2FC) %>% mutate(cell_type = gsub("/","_", cell_type))
+        welch_expression  <- read_csv(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/",tolower(geneset_name),"_genesets/manual_annotation",lam,"/welch_test/IPG_expression_welch_test.csv")) %>% dplyr::select(cell_type, program, FDR, log2FC) %>% mutate(cell_type = gsub("/","_", cell_type))
         # Wilcoxon-Mann-Whitney
-        wmw_activation    <- read_csv(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/",tolower(geneset_name),"_genesets/manual_annotation/wilcoxon_test/IPG_activation_WMW_test.csv")) %>% dplyr::select(cell_type, program, FDR, effect_size) %>% mutate(cell_type = gsub("/","_", cell_type))
-        wmw_expression    <- read.csv(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/",tolower(geneset_name),"_genesets/manual_annotation/wilcoxon_test/IPG_expression_WMW_test.csv")) %>% dplyr::select(cell_type, program, FDR, effect_size) %>% mutate(cell_type = gsub("/","_", cell_type))
+        wmw_activation               <- read_csv(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/",tolower(geneset_name),"_genesets/manual_annotation",lam,"/wilcoxon_test/IPG_activation_WMW_test.csv")) %>% dplyr::select(cell_type, program, FDR, effect_size) %>% mutate(cell_type = gsub("/","_", cell_type))
+        wmw_activation_sample_agg    <- read_csv(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/",tolower(geneset_name),"_genesets/manual_annotation",lam,"/wilcoxon_test_sample_aggregated/IGP_activation_WMW_test_sample_aggregated.csv")) %>% dplyr::select(cell_type, program, FDR, effect_size) %>% mutate(cell_type = gsub("/","_", cell_type))
+        wmw_expression               <- read.csv(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/",tolower(geneset_name),"_genesets/manual_annotation",lam,"/wilcoxon_test/IPG_expression_WMW_test.csv")) %>% dplyr::select(cell_type, program, FDR, effect_size) %>% mutate(cell_type = gsub("/","_", cell_type))
         
         gigatable <- lmm_patient %>%    mutate(program_short = str_split_i(program, "-X-", 3)) %>% 
                                         relocate(program_short, .after = program) %>% 
@@ -34,6 +35,7 @@ for (geneset_name in genesets) {
                                         full_join(welch_activation %>% dplyr::rename("FDR_welch_activation" = "FDR", "log2FC_welch_activation" = "log2FC"), by = c("cell_type", "program")) %>% 
                                         full_join(welch_expression %>% dplyr::rename("FDR_welch_expression" = "FDR", "log2FC_welch_expression" = "log2FC", "program_short" = "program"), by = c("cell_type", "program_short")) %>% 
                                         full_join(wmw_activation %>% dplyr::rename("FDR_wmw_activation" = "FDR", "effect_size_wmw_activation" = "effect_size"), by = c("cell_type", "program")) %>% 
+                                        full_join(wmw_activation_sample_agg %>% dplyr::rename("FDR_wmw_activation_sample_agg" = "FDR", "effect_size_wmw_activation_sample_agg" = "effect_size"), by = c("cell_type", "program")) %>% 
                                         full_join(wmw_expression %>% dplyr::rename("FDR_wmw_expression" = "FDR", "effect_size_wmw_expression" = "effect_size", "program_short" = "program"), by = c("cell_type", "program_short")) %>% 
                                         mutate(program_short = ifelse(is.na(program_short), str_split_i(program, "-X-", 3), program_short))
         
@@ -148,10 +150,10 @@ for (geneset_name in genesets) {
         # Add program topic
         gigatable <- gigatable %>% 
                         left_join(program_description %>% 
-                                          select(gene_set_name, gene_set_topic),
+                                          dplyr::select(gene_set_name, gene_set_topic),
                                   by = join_by("program_short"=="gene_set_name")) %>%
                         dplyr::rename("program_topic" = "gene_set_topic") %>% 
                         relocate(program_topic, .after = program_short)
         
-        write_csv(gigatable, "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation/gigatable.csv")
+        write_csv(gigatable, paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation",lam,"/gigatable.csv"))
 }

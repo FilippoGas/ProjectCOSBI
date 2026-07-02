@@ -2,7 +2,7 @@ Filippo Gastaldello - 26/01/26
 
 Analysis of the output of SPECTRA
 
-```{r}
+```{r message=FALSE}
 library(lme4)
 library(lmerTest)
 library(broom.mixed)
@@ -26,6 +26,15 @@ library(enrichplot)
 library(effectsize)
 ```
 
+```{r}
+output_dir            <- "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation_lam_0.1/"
+cell_score_path       <- "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/manual_annotation/Natri_et_al_full_manual_anno_cell_scores_93908.hpc3-head1.unitn.it.csv"
+metadata_path         <- "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/Natri_et_al_metadata.csv"
+factor_marker_path    <- "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/manual_annotation/Natri_et_al_full_manual_anno_factor_markers_93908.hpc3-head1.unitn.it.csv"
+cytopus_gene_set_path <- "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cytopus_gene_sets/knowledgebase_gene_sets_manual_annotation.json"
+```
+
+
 # Data loading and preprocess
 ```{r}
 # Define cell type annotation and gene sets to be used
@@ -33,9 +42,9 @@ annotation <- "manual"
 annotation_column <- "manual_annotation_1"
 
 # Cell scores quantify the activation of each gene program in every cell
-cell_scores <- read_csv("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/manual_annotation/Natri_et_al_full_manual_anno_cell_scores_93908.hpc3-head1.unitn.it.csv") %>% dplyr::rename("cell_id"="...1")
+cell_scores <- read_csv(cell_score_path) %>% dplyr::rename("cell_id"="...1")
 # Expression metadata are needed to match cell id to their cell type
-metadata <- read_csv("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/Natri_et_al_metadata.csv")
+metadata <- read_csv(metadata_path)
 # Only keep metadata for cells in the SPECTRA output
 metadata <- metadata %>% filter(cell_id %in% cell_scores$cell_id)
 # Add condition column to cell scores
@@ -46,9 +55,78 @@ cell_scores <- cell_scores %>%
                         relocate(Sample_Name, .before = Diagnosis) %>% 
                         relocate(annotation_column, .after=Diagnosis)
 colnames(cell_scores)[3] <- "annotation"
-# Remove programs without a name
-unknown_programs <- grep("\\d+$", colnames(cell_scores)[6:length(colnames(cell_scores))], value = TRUE)
-cell_scores <- cell_scores %>% dplyr::select(-all_of(unknown_programs))
+
+# Split cell_score in known and unknown programs
+unknown_programs    <- grep("\\d+$", colnames(cell_scores)[6:length(colnames(cell_scores))], value = TRUE)
+unknown_cell_scores <- cell_scores %>% dplyr::select(all_of(c(colnames(cell_scores)[1:5], unknown_programs)))
+cell_scores         <- cell_scores %>% dplyr::select(-all_of(unknown_programs))
+
+
+# Use Over Representation Analysis to give a name to unknown programs
+
+# Get factor markers to use in the enrichment 
+markers <- read_csv(factor_marker_path) %>% dplyr::select(all_of(unknown_programs))
+
+# Cytopus is used as gene set DB to perform enrichment
+cytopus_gene_sets <- read_json(cytopus_gene_set_path)
+universe_symbol <- markers %>% 
+                        pivot_longer(everything()) %>% 
+                        pull(value) %>% 
+                        unique()
+
+# Perform enrichment
+res <- lapply(unknown_programs, function(factor){
+        
+        cell_type <- str_split_i(factor, "-X-", 2)
+        cell_type <- ifelse(cell_type == "global", "all", cell_type)
+        
+        # Prepare Cytopus term2gene for current cell type (program specificity)
+        if(cell_type=="all") {
+                cytopus_list <- c(cytopus_gene_sets[["global"]])
+        }else{
+                cytopus_list <- c(cytopus_gene_sets[[cell_type]], cytopus_gene_sets[["global"]])
+        }
+        cytopus_list <- lapply(cytopus_list, function(x) as.character(unlist(x, use.names = FALSE)))
+        
+        cytopus_term2gene <- data.frame(
+                term = rep(names(cytopus_list), lengths(cytopus_list)),
+                gene = unlist(cytopus_list, use.names = FALSE)
+        )
+        # Run ORA against Cytopus using factor markers
+        ora_results <- enricher(markers %>% pull(factor),
+                                minGSSize = 5,
+                                universe  = universe_symbol,
+                                TERM2GENE = cytopus_term2gene)
+        
+        if(is.null(ora_results)){ return(data.frame(fact = factor, name = factor)) }
+        
+        ora_results <- ora_results@result %>% 
+                        filter(p.adjust <= 0.05) %>% 
+                        mutate(GeneRatio = as.numeric(str_split_i(GeneRatio, "/",1))/as.numeric(str_split_i(GeneRatio, "/",2))) %>% 
+                        slice_min(GeneRatio) %>% 
+                        pull(ID)
+        
+        ora_results <- ifelse(is_empty(ora_results), str_split_i(factor, "-X-",1), paste0(ora_results,"-(ORA)"))        # Keep track of which programs     
+                                                                                                                        # were named through ORA
+        return(data.frame(fact = factor,
+                          name = paste0(str_split_i(factor, "-X-",1),
+                                        "-X-",
+                                        str_split_i(factor, "-X-",2),
+                                        "-X-",
+                                        ora_results)))
+})
+
+factor_names <- bind_rows(res)
+
+# Add name to the programs that were identified
+colnames(unknown_cell_scores)[6:ncol(cell_scores)] <- factor_names$name
+
+# Identify programs that remained unknown and remove them
+unknown_programs    <- grep("\\d+$", colnames(unknown_cell_scores)[6:length(colnames(unknown_cell_scores))], value = TRUE)
+unknown_cell_scores <- unknown_cell_scores %>% dplyr::select(-all_of(unknown_programs))
+
+# Merge cell_scores and unknown_cell_scores
+cell_scores <- cell_scores %>% left_join(unknown_cell_scores %>% dplyr::select(-c(1:4)), by = "cell_id")
 ```
 # Upnaired Welch's test (DAP)
 
@@ -114,8 +192,8 @@ IGP_activation_welch <- IGP_activation_welch %>%
 IGP_activation_welch <- IGP_activation_welch %>% mutate(delta_active = active_cells_case_perc - active_cells_control_perc,
                                                         log2FC = log2(case_avg/control_avg))
 
-if(! dir.exists(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/"))){dir.create(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/"), recursive = TRUE)}
-write_csv(IGP_activation_welch, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/IPG_activation_welch_test.csv"))
+if(! dir.exists(paste0(output_dir, "welch_test/"))){dir.create(paste0(output_dir, "welch_test/"), recursive = TRUE)}
+write_csv(IGP_activation_welch, file = paste0(output_dir, "welch_test/IPG_activation_welch_test.csv"))
 ```
 
 ## Boxplots - facet
@@ -137,7 +215,7 @@ p <- plot_data %>% ggplot(aes(x=program, y=value, fill=Diagnosis))+
                 )+
                 facet_wrap(~cell_type, scale="free")
 p
-ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/boxplots_DAP/boxplot_welch_significant_facet_celltype.pdf"), plot = p, device = "pdf", width = 18, height = 15, create.dir = TRUE)
+ggsave(filename = paste0(output_dir, "welch_test/boxplots_DAP/boxplot_welch_significant_facet_celltype.pdf"), plot = p, device = "pdf", width = 18, height = 15, create.dir = TRUE)
 ```
 ## Boxplots - per celltype
 
@@ -172,7 +250,7 @@ for (celltype in unique(plot_data$cell_type)) {
                                                                   )
                                                                                         
         
-        ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation,"_annotation/welch_test/boxplots_DAP/boxplot_welch_significant_", gsub("/","_",celltype),".pdf"), plot = p, device = "pdf", width = 12, height = 8, create.dir = TRUE)
+        ggsave(filename = paste0(output_dir, "/welch_test/boxplots_DAP/boxplot_welch_significant_", gsub("/","_",celltype),".pdf"), plot = p, device = "pdf", width = 12, height = 8, create.dir = TRUE)
 }
 ```
 ## Volcano plot
@@ -209,7 +287,7 @@ p <- plot_data %>% ggplot(aes(x=log2FC, y=-log10(FDR), color = diff_activated)) 
                         nudge_y = .5,) +
                 theme_minimal()
 p
-ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/volcano_welch_DAP.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+ggsave(filename = paste0(output_dir, "welch_test/volcano_welch_DAP.pdf"), plot = p, device = "pdf", width = 10, height = 15, create.dir = TRUE)
 ```
 # Unpaired Welch's test (expression)
 
@@ -281,7 +359,7 @@ IGP_expression_welch <- IGP_expression_welch %>%
 # logFC <- log(case_avg/control_avg)
 IGP_expression_welch <- IGP_expression_welch %>% mutate(log2FC = log2(case_avg/control_avg))
 
-write_csv(IGP_expression_welch, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/IPG_expression_welch_test.csv"))
+write_csv(IGP_expression_welch, file = paste0(output_dir, "welch_test/IPG_expression_welch_test.csv"))
 ```
 
 ## Boxplots - facet and per celltype
@@ -349,13 +427,13 @@ plots <- lapply(unique(welch_sig$cell_type), function(celltype){
                                 theme_minimal()
                                                                                         
         
-        ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation,"_annotation/welch_test/boxplots_DEG/boxplot_welch_significant_", gsub("/","_",celltype),".pdf"), plot = p, device = "pdf", width = 10, height = 7, create.dir = TRUE)
+        ggsave(filename = paste0(output_dir, "welch_test/boxplots_DEG/boxplot_welch_significant_", gsub("/","_",celltype),".pdf"), plot = p, device = "pdf", width = 10, height = 7, create.dir = TRUE)
         
         return(p)
 })
 
 combined_plot <- wrap_plots(plots)
-ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation ,"_annotation/welch_test/boxplots_DEG/boxplot_welch_significant_facet.pdf"), plot = combined_plot, width = 25, height = 25, create.dir = TRUE)
+ggsave(filename = paste0(output_dir, "welch_test/boxplots_DEG/boxplot_welch_significant_facet.pdf"), plot = combined_plot, width = 25, height = 25, create.dir = TRUE)
 ```
 
 ## Volcano plot
@@ -392,7 +470,7 @@ p <- plot_data %>% ggplot(aes(x=log2FC, y=-log10(FDR), color = diff_expressed)) 
                         nudge_y = .5,) +
                 theme_minimal()
 p
-ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/welch_test/volcano_welch_DEG.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+ggsave(filename = paste0(output_dir, "welch_test/volcano_welch_DEG.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
 ```
 
 # Wilcoxon-Mann-Whitney test (DAP)
@@ -465,8 +543,8 @@ IGP_activation_WMW <- IGP_activation_WMW %>%
   # Apply the Rank-Biserial Formula using the sample sizes
   mutate(effect_size = abs(1 - (2 * statistic) / (n_active_control * n_active_case)))
 
-if(! dir.exists(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/"))){dir.create(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/"), recursive = TRUE)}
-write_csv(IGP_activation_WMW, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/IPG_activation_WMW_test.csv"))
+if(! dir.exists(paste0(output_dir, "wilcoxon_test/"))){dir.create(paste0(output_dir, "wilcoxon_test/"), recursive = TRUE)}
+write_csv(IGP_activation_WMW, file = paste0(output_dir, "wilcoxon_test/IPG_activation_WMW_test.csv"))
 ```
 
 ## Boxplots - facet
@@ -488,7 +566,7 @@ p <- plot_data %>% ggplot(aes(x=program, y=value, fill=Diagnosis))+
                 )+
                 facet_wrap(~cell_type, scale="free")
 p
-ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/boxplots_DAP/boxplot_wilcoxon_significant_facet_celltype.pdf"), plot = p, device = "pdf", width = 18, height = 15, create.dir = TRUE)
+ggsave(filename = paste0(output_dir, "wilcoxon_test/boxplots_DAP/boxplot_wilcoxon_significant_facet_celltype.pdf"), plot = p, device = "pdf", width = 18, height = 15, create.dir = TRUE)
 ```
 ## Boxplots - per celltype
 
@@ -523,7 +601,7 @@ for (celltype in unique(plot_data$cell_type)) {
                                                                   )
                                                                                         
         
-        ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation,"_annotation/wilcoxon_test/boxplots_DAP/boxplot_wilcoxon_significant_", gsub("/", "_", celltype),".pdf"), plot = p, device = "pdf", width = 12, height = 8, create.dir = TRUE)
+        ggsave(filename = paste0(output_dir, "wilcoxon_test/boxplots_DAP/boxplot_wilcoxon_significant_", gsub("/", "_", celltype),".pdf"), plot = p, device = "pdf", width = 12, height = 8, create.dir = TRUE)
 }
 ```
 ## Scatter plot FDR vs effect size
@@ -560,7 +638,7 @@ p <- plot_data %>% ggplot(aes(x=effect_size, y=-log10(FDR), color = effect)) +
                                 nudge_y = .5,) +
                         theme_minimal()
 p
-ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/scatterplot_wilcoxon_DAP.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+ggsave(filename = paste0(output_dir, "wilcoxon_test/scatterplot_wilcoxon_DAP.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
 ```
 
 # Wilcoxon-Mann-Whitney test (DAP, sample aggregated)
@@ -665,8 +743,8 @@ IGP_activation_WMW_sample_agg <- IGP_activation_WMW_sample_agg %>%
   ungroup() %>% 
   relocate(FDR, .after = p) %>%
   mutate(log2FC = log2(avg_activation_case / avg_activation_control))
-if(! dir.exists(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/"))){dir.create(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/"), recursive = TRUE)}
-write_csv(IGP_activation_WMW_sample_agg, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/IGP_activation_WMW_test_sample_aggregated.csv"))
+if(! dir.exists(paste0(output_dir, "wilcoxon_test_sample_aggregated/"))){dir.create(paste0(output_dir, "wilcoxon_test_sample_aggregated/"), recursive = TRUE)}
+write_csv(IGP_activation_WMW_sample_agg, file = paste0(output_dir, "wilcoxon_test_sample_aggregated/IGP_activation_WMW_test_sample_aggregated.csv"))
 ```
 
 ## Boxplots - facet
@@ -695,7 +773,7 @@ p <- plot_data %>% ggplot(aes(x=program, y=value, fill=Diagnosis))+
                 ) +
                 facet_wrap(~annotation, scale="free")
 
-ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test_sample_aggregated/boxplots_DAP/boxplot_wilcoxon_significant_facet_celltype.pdf"), plot = p, device = "pdf", width = 18, height = 15, create.dir = TRUE)
+ggsave(filename = paste0(output_dir, "wilcoxon_test_sample_aggregated/boxplots_DAP/boxplot_wilcoxon_significant_facet_celltype.pdf"), plot = p, device = "pdf", width = 18, height = 15, create.dir = TRUE)
 ```
 ## Boxplot - per celltype
 
@@ -715,7 +793,7 @@ for (celltype in unique(plot_data$annotation)) {
                                 ) +
                         labs(
                                 title = paste0("IGP with significant differences in activation between case and control in ",celltype," cells."),
-                                y = "Activation level"
+                                y     = "Activation level"
                                 ) +
                         stat_compare_means(
                                 aes(group = Diagnosis),
@@ -742,7 +820,7 @@ for (celltype in unique(plot_data$annotation)) {
                                 )
                                                                                         
         
-        ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation,"_annotation/wilcoxon_test_sample_aggregated/boxplots_DAP/boxplot_wilcoxon_significant_", gsub("/", "_", celltype),".pdf"), plot = p, device = "pdf", width = 12, height = 8, create.dir = TRUE)
+        ggsave(filename = paste0(output_dir, "wilcoxon_test_sample_aggregated/boxplots_DAP/boxplot_wilcoxon_significant_", gsub("/", "_", celltype),".pdf"), plot = p, device = "pdf", width = 12, height = 8, create.dir = TRUE)
 }
 ```
 
@@ -787,7 +865,7 @@ p <- plot_data %>% ggplot(aes(x = effect_size, y = -log10(FDR), color = sig)) +
                                 ) +
                         theme_minimal()
 ggsave(plot = p,
-       filename = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation/wilcoxon_test_sample_aggregated/volcano_FDR_effect_size.pdf",
+       filename = paste0(output_dir, "wilcoxon_test_sample_aggregated/volcano_FDR_effect_size.pdf"),
        create.dir = TRUE,
        height = 9,
        width = 13,
@@ -872,7 +950,7 @@ IGP_expression_WMW <- IGP_expression_WMW %>%
                                 # Apply the Rank-Biserial Formula using the sample sizes
                                 mutate(effect_size = abs(1 - (2 * statistic) / (as.numeric(ctrl_cells_count) * as.numeric(case_cells_count))))
 
-write_csv(IGP_expression_WMW, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/IPG_expression_WMW_test.csv"))
+write_csv(IGP_expression_WMW, file = paste0(output_dir, "wilcoxon_test/IPG_expression_WMW_test.csv"))
 ```
 
 ## Boxplots - facet and per celltype
@@ -940,13 +1018,13 @@ plots <- lapply(unique(WMW_sig$cell_type), function(celltype){
                                 theme_minimal()
                                                                                         
         
-        ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation,"_annotation/wilcoxon_test/boxplots_DEG/boxplot_wilcoxon_significant_", gsub("/", "_", celltype),".pdf"), plot = p, device = "pdf", width = 10, height = 7, create.dir = TRUE)
+        ggsave(filename = paste0(output_dir, "wilcoxon_test/boxplots_DEG/boxplot_wilcoxon_significant_", gsub("/", "_", celltype),".pdf"), plot = p, device = "pdf", width = 10, height = 7, create.dir = TRUE)
         
         return(p)
 })
 
 combined_plot <- wrap_plots(plots)
-ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation ,"_annotation/wilcoxon_test/boxplots_DEG/boxplot_wilcoxon_significant_facet.pdf"), plot = combined_plot, width = 25, height = 25, create.dir = TRUE)
+ggsave(filename = paste0(output_dir, "wilcoxon_test/boxplots_DEG/boxplot_wilcoxon_significant_facet.pdf"), plot = combined_plot, width = 25, height = 25, create.dir = TRUE)
 ```
 
 ## Scatter plot FDR vs effect size
@@ -983,7 +1061,7 @@ p <- plot_data %>% ggplot(aes(x=effect_size, y=-log10(FDR), color = effect)) +
                                 nudge_y = .5,) +
                         theme_minimal()
 p
-ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/wilcoxon_test/scatterplot_wilcoxon_DEG.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+ggsave(filename = paste0(output_dir, "wilcoxon_test/scatterplot_wilcoxon_DEG.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
 ```
 
 # Linear Mixed Model (DAP)
@@ -1053,8 +1131,8 @@ IGP_activation_lmm <- IGP_activation_lmm %>%
 # Compute effect size as activationFC log2((avg_control_activation + estimate)/avg_case_activation)
 IGP_activation_lmm <- IGP_activation_lmm %>% mutate(log2FC = log2((avg_control_activation+estimate)/avg_control_activation))
 
-if(! dir.exists(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/lmm/"))){dir.create(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/lmm/"), recursive = TRUE)}
-write_csv(IGP_activation_lmm, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/lmm/IPG_activation_lmm.csv"))
+if(! dir.exists(paste0(output_dir, "lmm/"))){dir.create(paste0(output_dir, "lmm/"), recursive = TRUE)}
+write_csv(IGP_activation_lmm, file = paste0(output_dir, "lmm/IPG_activation_lmm.csv"))
 ```
 
 ## Volcano plot
@@ -1092,7 +1170,7 @@ p <- plot_data %>% ggplot(aes(x=log2FC, y=-log10(FDR), color = diff_activated)) 
                         nudge_y = .5,) +
                 theme_minimal()
 p
-ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/lmm/volcano_lmm.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+ggsave(filename = paste0(output_dir, "lmm/volcano_lmm.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
 ```
 
 
@@ -1161,7 +1239,7 @@ IGP_activation_lmm_phase_corrected <- IGP_activation_lmm_phase_corrected %>%
 # Compute effect size as activationFC log2((avg_control_activation + estimate)/avg_case_activation)
 IGP_activation_lmm_phase_corrected <- IGP_activation_lmm_phase_corrected %>% mutate(log2FC = log2((avg_control_activation+estimate)/avg_control_activation))
 
-write_csv(IGP_activation_lmm_phase_corrected, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/lmm/IPG_activation_lmm_phase_corrected.csv"))
+write_csv(IGP_activation_lmm_phase_corrected, file = paste0(output_dir, "lmm/IPG_activation_lmm_phase_corrected.csv"))
 ```
 
 ## Volcano plot
@@ -1200,7 +1278,7 @@ p <- plot_data %>% ggplot(aes(x=log2FC, y=-log10(FDR), color = diff_activated)) 
                         nudge_y = .5,) +
                 theme_minimal()
 p
-ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation,"_annotation/lmm/volcano_lmm_phase_corrected.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+ggsave(filename = paste0(output_dir, "lmm/volcano_lmm_phase_corrected.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
 ```
 
 # Comparison DEG vs DAP
@@ -1316,11 +1394,11 @@ total_DEGs <- DEGs %>% full_join(DEGs_pb, by = c("gene", "celltype"), suffix = c
 total_DEGs <- total_DEGs %>% mutate(both_sig = ifelse(is_sig_sc == TRUE & is_sig_pb == TRUE, TRUE, FALSE))
 
 
-if(! dir.exists(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/"))){dir.create(paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/"), recursive = TRUE)}
+if(! dir.exists(paste0(output_dir, "DE/"))){dir.create(paste0(output_dir, "DE/"), recursive = TRUE)}
 # Save all 3
-write_csv(DEGs, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/sc_DEGs.csv"))
-write_csv(DEGs_pb, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/pb_DEGs.csv"))
-write_csv(total_DEGs, file = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/total_DEGs.csv"))
+write_csv(DEGs, file = paste0(output_dir, "DE/sc_DEGs.csv"))
+write_csv(DEGs_pb, file = paste0(output_dir, "DE/pb_DEGs.csv"))
+write_csv(total_DEGs, file = paste0(output_dir, "DE/total_DEGs.csv"))
 ```
 
 ## Check overlap of DEGs in sc vs pseudo bulk
@@ -1351,7 +1429,7 @@ combined_plot <- wrap_plots(plot_list) +
   plot_annotation(title    = "Overlap between DEGs found in scDE and pseudo-bulkDE analyses",
                   subtitle = "Scatterplot showing logFC correlation between genes significantly altered (FDR<0.05 and log2FC>1) in both analyses (venn intersection)" )
 
-ggsave(filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation ,"_annotation/DE/sc_vs_pseudobulk_overlap.pdf"), plot = combined_plot, width = 25, height = 11, create.dir = TRUE)
+ggsave(filename = paste0(output_dir, "DE/sc_vs_pseudobulk_overlap.pdf"), plot = combined_plot, width = 25, height = 11, create.dir = TRUE)
 ```
 
 
@@ -1386,7 +1464,7 @@ p <- wrap_plots(p1, p2) + plot_annotation(title = "Correlation between single ce
                                           subtitle = "(Removed genes where single cell FDR was zero)")
 p
 
-ggsave(p, filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/FDR_sc_pb_correlation.pdf"), device = "pdf", width = 10, height = 5, create.dir = TRUE)
+ggsave(p, filename = paste0(output_dir, "DE/FDR_sc_pb_correlation.pdf"), device = "pdf", width = 10, height = 5, create.dir = TRUE)
 ```
 
 log2FC
@@ -1415,7 +1493,7 @@ p2 <- total_DEGs %>%
 p <- wrap_plots(p1, p2) + plot_annotation(title = "Correlation between single cell and pseudobulk Log2FC of differential analysis")
 p
 
-ggsave(p, filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/",annotation,"_annotation/DE/log2FC_sc_pb_correlation.pdf"), device = "pdf", width = 10, height = 5, create.dir = TRUE)
+ggsave(p, filename = paste0(output_dir, "DE/log2FC_sc_pb_correlation.pdf"), device = "pdf", width = 10, height = 5, create.dir = TRUE)
 ```
 
 # DEGs enrichment
@@ -1447,7 +1525,7 @@ gene_sets_names <- c("GO", "REACTOME", "CYTOPUS")
 ### Run gsea
 ```{r}
 # Output path
-base_out_path <- paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation, "_annotation/enrichment/gsea/")
+base_out_path <- paste0(output_dir, "enrichment/gsea/")
 
 # Define configurations for each analysis
 analysis_configs <- list(
@@ -1537,7 +1615,7 @@ for (cell_type in unique(total_DEGs$celltype)) {
 
 ```{r}
 # Output path
-base_ora_path <- paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/", annotation, "_annotation/enrichment/ora/")
+base_ora_path <- paste0(output_dir, "enrichment/ora/")
 
 analyses         <- c("sc", "pb", "both")
 class_columns    <- list("sc"="class_sc", "pb"="class_pb", "both"="class_pb")

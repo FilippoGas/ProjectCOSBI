@@ -21,16 +21,19 @@ def main():
     annotation_type     = sys.argv[1]
     annotation_column   = sys.argv[2]
     pbs_job_id          = sys.argv[3]
+    
+    lambd = float(sys.argv[4])
+
     # INPUT PATHS
     scKnowledgeBase_dict_path   = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cytopus_gene_sets/knowledgebase_gene_sets_"+annotation_type+"_annotation.json"
     sc_dataset_path             = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/AnnData/Natri_et_al_no_QC.h5ad"
 
     # OUTPUT PATHS
-    model_pickle_path       = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/"+annotation_type+"_annotation/Natri_et_al_full_"+annotation_type+"_anno_spectra_model_"+pbs_job_id+".pickle"
-    anndata_pickle_path     = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/"+annotation_type+"_annotation/Natri_et_al_full_"+annotation_type+"_anno_AnnData_"+pbs_job_id+".pickle"
-    gene_scores_csv_path    = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/"+annotation_type+"_annotation/Natri_et_al_full_"+annotation_type+"_anno_gene_scores_"+pbs_job_id+".csv"
-    cell_scores_csv_path    = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/"+annotation_type+"_annotation/Natri_et_al_full_"+annotation_type+"_anno_cell_scores_"+pbs_job_id+".csv"
-    factor_markers_csv_path = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/"+annotation_type+"_annotation/Natri_et_al_full_"+annotation_type+"_anno_factor_markers_"+pbs_job_id+".csv"
+    anndata_pickle_path     = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/"+annotation_type+"_annotation/Natri_et_al_full_lambda_"+str(lambd)+"_"+annotation_type+"_anno_AnnData_"+pbs_job_id+".pickle"
+    gene_scores_csv_path    = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/"+annotation_type+"_annotation/Natri_et_al_full_lambda_"+str(lambd)+"_"+annotation_type+"_anno_gene_scores_"+pbs_job_id+".csv"
+    model_pickle_path       = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/"+annotation_type+"_annotation/Natri_et_al_full_lambda_"+str(lambd)+"_"+annotation_type+"_anno_spectra_model_"+pbs_job_id+".pickle"
+    cell_scores_csv_path    = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/"+annotation_type+"_annotation/Natri_et_al_full_lambda_"+str(lambd)+"_"+annotation_type+"_anno_cell_scores_"+pbs_job_id+".csv"
+    factor_markers_csv_path = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/"+annotation_type+"_annotation/Natri_et_al_full_lambda_"+str(lambd)+"_"+annotation_type+"_anno_factor_markers_"+pbs_job_id+".csv"
 
     # LOAD DATA
     # Load gene sets dictionary from cytopus
@@ -55,7 +58,7 @@ def main():
                                     use_highly_variable=False,
                                     cell_type_key=annotation_column,
                                     use_weights=True,
-                                    lam=0.1,
+                                    lam=lambd,
                                     delta=0.001,
                                     kappa=None,
                                     rho=0.001,

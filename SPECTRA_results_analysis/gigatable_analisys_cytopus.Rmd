@@ -4,116 +4,98 @@ Filippo Gastaldello - 17/03/2026
 library(tidyverse)
 library(ComplexHeatmap)
 library(ggrepel)
-```
-
-# Paths
-```{r}
-# Inputs
-gigatable_path <- "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation/gigatable.csv"
-
-# Plots output
-out_dir <- "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation/methods_comparison/"
-```
-
-```{r}
-gigatable <- read_csv(gigatable_path)
+library(ggridges)
+library(viridis)
+library(patchwork)
+library(UpSetR)
+library(ggpubr)
 ```
 
 # Thresholds
 ```{r}
 FDR_padj_thresh         <- 0.05
 log2FC_lmm_phase_thresh <- 1
+effect_size_WMW_thresh  <- 0.3
 ```
 
-# LMM-GSEA-ORA
+# Paths
+```{r}
+lam <- "_lam_0.001"
+
+# Inputs
+gigatable_path <- paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation",lam,"/gigatable.csv")
+
+# Plots output
+out_dir <- paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation",lam,"/methods_comparison/wmw_thresh_", effect_size_WMW_thresh, "/")
+if (!dir.exists(out_dir)) {dir.create(out_dir, recursive = TRUE)}
+```
+
+```{r}
+gigatable <- read_csv(gigatable_path)
+```
+
+
+# WMW-LMM-GSEA-ORA
 
 ## Intersection (UpSet plot)
 
-Check overlap in the lists of deregulated programs according to LMM, GSEA and ORA
+Check overlap in the lists of deregulated programs according to WMW, LMM, GSEA and ORA
 
 ```{r}
 upset_data <- list(
-  LMM = gigatable %>% 
-    filter(FDR_lmm_phase<0.05,
-           abs(log2FC_lmm_phase)>1) %>% 
-    mutate(label = paste0(cell_type, "_", program_short)) %>% 
-    pull(label) %>% 
-    unique(),
-  
-  GSEA_sc = gigatable %>% 
-    filter(!is.na(padj_GSEA_sc)) %>% 
-    mutate(label = paste0(cell_type, "_", program_short)) %>% 
-    pull(label) %>% 
-    unique(),
-  
-  GSEA_pb = gigatable %>% 
-    filter(!is.na(padj_GSEA_pb)) %>% 
-    mutate(label = paste0(cell_type, "_", program_short)) %>% 
-    pull(label) %>% 
-    unique(),
-  
-  ORA_sc = gigatable %>% 
-    filter(!is.na(padj_ORA_UP_sc) | !is.na(padj_ORA_DOWN_sc)) %>% 
-    mutate(label = paste0(cell_type, "_", program_short)) %>% 
-    pull(label) %>% 
-    unique(),
-  
-  ORA_pb = gigatable %>% 
-    filter(!is.na(padj_ORA_UP_pb) | !is.na(padj_ORA_DOWN_pb)) %>% 
-    mutate(label = paste0(cell_type, "_", program_short)) %>% 
-    pull(label) %>% 
-    unique(),
-  
-  ORA_both = gigatable %>% 
-    filter(!is.na(padj_ORA_UP_both) | !is.na(padj_ORA_DOWN_both)) %>% 
-    mutate(label = paste0(cell_type, "_", program_short)) %>% 
-    pull(label) %>% 
-    unique()
+        WMW = gigatable %>%
+                filter(FDR_wmw_activation_sample_agg < FDR_padj_thresh,
+                       abs(effect_size_wmw_activation_sample_agg) > effect_size_WMW_thresh) %>% 
+                mutate(label = paste0(cell_type, "_", program_short)) %>% 
+                pull(label) %>% 
+                unique(),
+              
+        LMM = gigatable %>% 
+                filter(FDR_lmm_phase<FDR_padj_thresh,
+                       abs(log2FC_lmm_phase)>1) %>% 
+                mutate(label = paste0(cell_type, "_", program_short)) %>% 
+                pull(label) %>% 
+                unique(),
+        
+        GSEA_sc = gigatable %>% 
+                filter(!is.na(padj_GSEA_sc)) %>% 
+                mutate(label = paste0(cell_type, "_", program_short)) %>% 
+                pull(label) %>% 
+                unique(),
+        
+        GSEA_pb = gigatable %>%
+                filter(!is.na(padj_GSEA_pb)) %>%
+                mutate(label = paste0(cell_type, "_", program_short)) %>% 
+                pull(label) %>% 
+                unique(),
+        
+        ORA_sc = gigatable %>% 
+                filter(!is.na(padj_ORA_UP_sc) | !is.na(padj_ORA_DOWN_sc)) %>% 
+                mutate(label = paste0(cell_type, "_", program_short)) %>% 
+                pull(label) %>% 
+                unique(),
+        
+        ORA_pb = gigatable %>%
+                filter(!is.na(padj_ORA_UP_pb) | !is.na(padj_ORA_DOWN_pb)) %>% 
+                mutate(label = paste0(cell_type, "_", program_short)) %>% 
+                pull(label) %>% 
+                unique(),
+        
+        ORA_both = gigatable %>% 
+                filter(!is.na(padj_ORA_UP_both) | !is.na(padj_ORA_DOWN_both)) %>% 
+                mutate(label = paste0(cell_type, "_", program_short)) %>% 
+                pull(label) %>% 
+                unique()
 )
 ```
 
-### Horizontal
+## Horizontal upset
 ```{r}
-upset_data <- list(
-                LMM = gigatable %>% 
-                        filter(FDR_lmm_phase<0.05,
-                               abs(log2FC_lmm_phase)>1) %>% 
-                        mutate(label = paste0(cell_type, "_", program_short)) %>% 
-                        pull(label) %>% 
-                        unique(),
-                GSEA_sc = gigatable %>% 
-                                filter(!is.na(padj_GSEA_sc)) %>% 
-                                mutate(label = paste0(cell_type, "_", program_short)) %>% 
-                                pull(label) %>% 
-                                unique(),
-                GSEA_pb = gigatable %>% 
-                                filter(!is.na(padj_GSEA_pb)) %>% 
-                                mutate(label = paste0(cell_type, "_", program_short)) %>% 
-                                pull(label) %>% 
-                                unique(),
-                ORA_sc = gigatable %>% 
-                                filter(!is.na(padj_ORA_UP_sc) | !is.na(padj_ORA_DOWN_sc)) %>% 
-                                mutate(label = paste0(cell_type, "_", program_short)) %>% 
-                                pull(label) %>% 
-                                unique(),
-                ORA_pb = gigatable %>% 
-                                filter(!is.na(padj_ORA_UP_pb) | !is.na(padj_ORA_DOWN_pb)) %>% 
-                                mutate(label = paste0(cell_type, "_", program_short)) %>% 
-                                pull(label) %>% 
-                                unique(),
-                ORA_both = gigatable %>% 
-                                filter(!is.na(padj_ORA_UP_both) | !is.na(padj_ORA_DOWN_both)) %>% 
-                                mutate(label = paste0(cell_type, "_", program_short)) %>% 
-                                pull(label) %>% 
-                                unique()
-
-)
-
 # RUN THIS PART IN CONSOLE
-pdf(file = paste0(out_dir, "upset_LMM_GSEA_ORA.pdf"), width = 9, height = 5, onefile = FALSE)
+pdf(file = paste0(out_dir, "upset_WMW_LMM_GSEA_ORA.pdf"), width = 9, height = 5, onefile = FALSE)
 upset(fromList(upset_data),
       order.by = "freq",
-      nsets = 6)
+      nsets = 7)
 dev.off()
 ```
 
@@ -123,19 +105,25 @@ m <- m[comb_degree(m) > 1]
 
 m_transposed <- t(m)
 
+# Extract properties
 all_codes <- comb_name(m_transposed)
 all_sizes <- comb_size(m_transposed)
 all_degrees <- comb_degree(m_transposed) 
 
-lmm_index <- which(set_name(m_transposed) == "LMM")
+# Dynamically find which position in the binary code corresponds to WMW
+wmw_index <- which(set_name(m_transposed) == "WMW")
 
+# Sort by degree, then by size
 plot_order <- order(all_degrees, all_sizes, decreasing = TRUE)
 
+# Generate labels using the WMW condition
 all_labels <- sapply(seq_along(all_codes), function(i) {
   
-  includes_lmm <- substr(all_codes[i], lmm_index, lmm_index) == "1"
+  # Check if the character at the wmw_index is "1" (meaning WMW is present)
+  includes_wmw <- substr(all_codes[i], wmw_index, wmw_index) == "1"
   
-  if ((all_degrees[i] >= 3 && all_sizes[i] < 7) || includes_lmm) {
+  # Condition: (Degree >= 3 AND Size <= 7) OR (WMW is included)
+  if ((all_degrees[i] >= 3 && all_sizes[i] <= 7) || includes_wmw) {
     items <- extract_comb(m, all_codes[i])
     return(paste(items, collapse = "\n"))
   } else {
@@ -143,6 +131,7 @@ all_labels <- sapply(seq_along(all_codes), function(i) {
   }
 })
 
+# Create right annotation with just numbers and text
 combined_right_annotation <- rowAnnotation(
   "Size" = anno_text(
     as.character(all_sizes), 
@@ -158,7 +147,8 @@ combined_right_annotation <- rowAnnotation(
   gap = unit(4, "mm") 
 )
 
-pdf(file = paste0(out_dir, "upset_LMM_GSEA_ORA_vertical.pdf"), width = 11, height = 20, onefile = FALSE)
+# Draw the plot
+pdf(file = paste0(out_dir, "upset_WMW_LMM_GSEA_ORA_vertical.pdf"), width = 11, height = 20, onefile = FALSE)
 
 draw(UpSet(
   m_transposed, 
@@ -173,7 +163,7 @@ dev.off()
 
 # LMM - GSEA
 ## LMM to GSEA
-Volcano plot of program activation (SPECTRA scores) according to LMM, with information about significance in GSEA analysis.
+Volcano plot of program activation (SPECTRA scores) according to LMM, with annotation about significance in GSEA analysis.
 ```{r}
 plot_data <- gigatable %>%  
                   filter(!is.na(log2FC_lmm_phase)) %>% 
@@ -453,72 +443,557 @@ lapply(names(configs), function(name){
                                         ) +
                                 theme_minimal()
         ggsave(plot = p,
-               filename = paste0("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation/methods_comparison/LMM-ORA/ORA_", name, "_scatter_LMM.pdf"),
+               filename = paste0(out_dir,"LMM-ORA/ORA_", name, "_scatter_LMM.pdf"),
                width = 10,
                height = 7,
                device = "pdf",
                create.dir = TRUE)
 })
 ```
+# WMW - GSEA
+## WMW to GSEA
+Volcano plot of program activation (SPECTRA scores) according to WMW with aggregated sample scores, with annotation about significance in GSEA analysis.
+```{r}
+plot_data <- gigatable %>%  
+                  filter(!is.na(effect_size_wmw_activation_sample_agg)) %>% 
+                  dplyr::select(cell_type,
+                                program,
+                                program_short,
+                                FDR_wmw_activation_sample_agg,
+                                effect_size_wmw_activation_sample_agg,
+                                padj_GSEA_sc,
+                                NES_GSEA_sc,
+                                padj_GSEA_pb,
+                                NES_GSEA_pb) %>% 
+                  mutate(also_sig_in = case_when(
+                                                !is.na(padj_GSEA_sc) & !is.na(padj_GSEA_pb) ~ "both",
+                                                !is.na(padj_GSEA_sc)                        ~ "sc",
+                                                !is.na(padj_GSEA_pb)                        ~ "pb",
+                                                TRUE                                        ~ NA_character_
+                                                ),
+                         also_sig_in = as.factor(also_sig_in),
+                         diff_activated = case_when(
+                                                FDR_wmw_activation_sample_agg < FDR_padj_thresh & effect_size_wmw_activation_sample_agg > effect_size_WMW_thresh ~ "UP",
+                                                FDR_wmw_activation_sample_agg < FDR_padj_thresh & effect_size_wmw_activation_sample_agg < -effect_size_WMW_thresh ~ "DOWN",
+                                                TRUE ~ "NO"
+                                                     )
+                         )
+
+p <- plot_data %>% ggplot(aes(x = effect_size_wmw_activation_sample_agg, y = -log10(FDR_wmw_activation_sample_agg), color = diff_activated, shape = also_sig_in)) + 
+                geom_point(size = 2) +
+                geom_vline(
+                        xintercept = c(-effect_size_WMW_thresh, effect_size_WMW_thresh),
+                        col = 'black',
+                        linetype = 'dashed'
+                        ) +
+                geom_hline(
+                        yintercept = -log10(FDR_padj_thresh),
+                        col = 'black',
+                        linetype = 'dashed'
+                        ) +
+                scale_colour_manual(
+                        values = c("UP" = "red", "DOWN" = "purple", "NO" = "grey")
+                        ) +
+                scale_shape_manual(
+                        values   = c("sc" = 15, "pb" = 17, "both" = 18),
+                        na.value = 16,
+                        breaks   = c("sc", "pb", "both"),
+                        labels   = c("Single cell GSEA", "Pseudobulk GSEA", "Both")
+                        ) +
+                xlim(
+                        (plot_data %>% filter(diff_activated == "UP" | diff_activated == "DOWN") %>% pull(effect_size_wmw_activation_sample_agg) %>% min()) * 1.1,
+                        (plot_data %>% filter(diff_activated == "UP" | diff_activated == "DOWN") %>% pull(effect_size_wmw_activation_sample_agg) %>% max()) * 1.1
+                        ) +
+                ylim(
+                        0,
+                        (plot_data %>% filter(diff_activated == "UP" | diff_activated == "DOWN") %>% pull(FDR_wmw_activation_sample_agg) %>% log10() %>% min()) * -1.1
+                        ) +
+                xlab("Effect size") +
+                ylab("-log10(FDR)") +
+                labs(
+                        title    = "Program deregulation according to Wilcoxon U-test analyzing Spectra scores aggregated per sample.",
+                        subtitle = "Between parentesis is the cell type in which such problem was found deregulated.",
+                        color    = "Program deregulation",
+                        shape    = "Also found in"
+                        ) +
+                geom_label_repel(
+                        data               = plot_data %>% filter(diff_activated == "UP" | diff_activated == "DOWN"),
+                        aes(label = paste0("(", cell_type, ")", " ", program_short)),
+                        size               = 2.5,           
+                        max.overlaps       = Inf,   
+                        box.padding        = 0.5,
+                        point.padding      = 0.2,
+                        min.segment.length = 0,
+                        nudge_x            = .15,
+                        nudge_y            = .5
+                        ) +
+                theme_minimal()
+
+ggsave(plot = p,
+       filename = paste0(out_dir, "WMW-GSEA/WMW_volcano_GSEA.pdf"),
+       device = "pdf",
+       width = 15,
+       height = 11,
+       create.dir = TRUE)
+write_csv(plot_data, paste0(out_dir, "WMW-GSEA/WMW_volcano_GSEA_plot_data.csv"))
+```
+
+## GSEA to WMW
+Given programs enriched in GSEA analysis, check if they are significantly altered according to WMW analysis of spectra scores, or if at least they have concordant sign
+```{r}
+configs <- list(
+                sc = list(
+                        padj  = "padj_GSEA_sc",
+                        NES   = "NES_GSEA_sc",
+                        title = "single cell"
+                ),
+                pb = list(
+                        padj  = "padj_GSEA_pb",
+                        NES   = "NES_GSEA_pb",
+                        title = "pseudobulk"
+                )
+)
+
+lapply(names(configs), function(name){
+                
+        conf <- configs[[name]]
+        
+        plot_data <- gigatable %>%
+                        filter(!is.na(.data[[conf$padj]])) %>% 
+                        dplyr::select(cell_type,
+                                      program_short,
+                                      FDR_wmw_activation_sample_agg,
+                                      effect_size_wmw_activation_sample_agg,
+                                      conf$padj,
+                                      conf$NES) %>% 
+                        mutate(concordant = case_when(
+                                                sign(effect_size_wmw_activation_sample_agg) == sign(.data[[conf$NES]]) & sign(effect_size_wmw_activation_sample_agg) == -1 ~ "DOWN",
+                                                sign(effect_size_wmw_activation_sample_agg) == sign(.data[[conf$NES]]) & sign(effect_size_wmw_activation_sample_agg) == 1  ~ "UP",
+                                                TRUE                                                                             ~ "no"
+                                                ),
+                               WMW_sig    = ifelse(FDR_wmw_activation_sample_agg < FDR_padj_thresh, "yes", "no")
+                               )
+        
+        p <- plot_data %>%
+                ggplot(aes(x = .data[[conf$NES]], y = effect_size_wmw_activation_sample_agg, color = concordant, shape = WMW_sig)) +
+                        geom_point(size = 2) +
+                        scale_color_manual(
+                                values  = c("UP" = "red", "DOWN" = "purple", "no" = "grey"),
+                                breaks  = c("UP", "DOWN", "no"),
+                                labels  = c("Both up", "Both down", "Discordant")
+                                ) +
+                        scale_shape_manual(
+                                values = c("yes" = 16, "no" = 4),
+                                breaks = c("yes", "no")
+                                ) +
+                        geom_vline(
+                                xintercept = 0,
+                                col        = "black",
+                                linetype   = "dashed"
+                                ) +
+                        geom_hline(
+                                yintercept = 0,
+                                col        = "black",
+                                linetype   = "dashed"
+                                ) +
+                        labs(
+                                title = paste0("Enriched programs in GSEA analysis according to ", conf$title," DEGs"),
+                                color = "GSEA NES vs WMW effect size sign",
+                                shape = "Significant (FDR<0.05) also in \nWMW analysis of Spectra scores"
+                                ) +
+                        xlab("Pseudobulk GSEA NES") +
+                        ylab("WMW effect size") +
+                        geom_label_repel(
+                                data               = plot_data %>% filter(!concordant == "no"),
+                                aes(label = paste0("(", cell_type, ")", " ", program_short)),
+                                size               = 2.5,           
+                                max.overlaps       = Inf,   
+                                box.padding        = 0.5,
+                                point.padding      = 0.2,
+                                min.segment.length = 0,
+                                nudge_x            = 0.15,
+                                nudge_y            = 0.5
+                                ) +
+                        theme_minimal()
+        
+        ggsave(plot       = p,
+               filename   = paste0(out_dir, "WMW-GSEA/GSEA_", name, "_scatter_WMW.pdf"),
+               device     = "pdf",
+               width      = 13,
+               height     = 10,
+               create.dir = TRUE)
+write_csv(plot_data, paste0(out_dir, "WMW-GSEA/GSEA_", name, "_scatter_WMW_plot_data.csv"))
+})
+```
+
+# WMW-ORA
+## ORA to WMW
+
+Given programs enriched in ORA analysis, check if they are significantly altered according to WMW analysis of spectra scores, or if at least they have concordant sign
+```{r}
+configs <- list(
+                sc = list(
+                        padj_up        = "padj_ORA_UP_sc",
+                        padj_down      = "padj_ORA_DOWN_sc",
+                        generatio_up   = "GeneRatio_ORA_UP_sc",
+                        generatio_down = "GeneRatio_ORA_DOWN_sc",
+                        title          = "single cell"
+                ),
+                pb = list(
+                        padj_up        = "padj_ORA_UP_pb",
+                        padj_down      = "padj_ORA_DOWN_pb",
+                        generatio_up   = "GeneRatio_ORA_UP_pb",
+                        generatio_down = "GeneRatio_ORA_DOWN_pb",
+                        title          = "pseudobulk"
+                ),
+                both = list(
+                        padj_up        = "padj_ORA_UP_both",
+                        padj_down      = "padj_ORA_DOWN_both",
+                        generatio_up   = "GeneRatio_ORA_UP_both",
+                        generatio_down = "GeneRatio_ORA_DOWN_both",
+                        title          = "both single cell and pseudobulk"
+                )
+)
+
+lapply(names(configs), function(name){
+
+        conf <- configs[[name]]
+
+        plot_data <- gigatable %>% 
+                        filter(!is.na(.data[[conf$padj_up]]) | !is.na(.data[[conf$padj_down]])) %>% 
+                        filter(!is.na(effect_size_wmw_activation_sample_agg)) %>% 
+                        dplyr::select(cell_type,
+                                      program_short,
+                                      FDR_wmw_activation_sample_agg,
+                                      effect_size_wmw_activation_sample_agg,
+                                      conf$padj_down,
+                                      conf$generatio_down,
+                                      conf$padj_up,
+                                      conf$generatio_up) %>% 
+                        mutate(!!conf$generatio_down := .data[[conf$generatio_down]] * -1) %>%  # Flip sign of gene ratio for down regulated programs to plot in negative quadrant
+                                                                                                # '!!' evaluate the content of the variable 'conf$generatio_down' and use it as columns name
+                                                                                                # ':=' allows the assignment to a dynamic evaluation
+                        mutate(up_concordant   = ifelse(!is.na(.data[[conf$padj_up]]) & sign(effect_size_wmw_activation_sample_agg) == 1, "yes","no"),
+                               up_concordant   = ifelse(is.na(up_concordant), "no", up_concordant),
+                               down_concordant = ifelse(!is.na(.data[[conf$padj_down]]) & sign(effect_size_wmw_activation_sample_agg) == -1, "yes", "no"),
+                               down_concordant = ifelse(is.na(down_concordant), "no", down_concordant),
+                               wmw_sig         = case_when(
+                                                        FDR_wmw_activation_sample_agg < FDR_padj_thresh    ~ "yes",
+                                                        TRUE                                               ~ "no"
+                               ))
+        # Transform the data first
+        plot_data_long <- plot_data %>%
+          # Combine UP and DOWN generatio into one X-axis column
+          pivot_longer(cols = c(conf$generatio_up, conf$generatio_down),
+                       names_to = "ora_direction",
+                       values_to = "generatio") %>%
+          mutate(concordance_status = case_when(
+                  ora_direction == conf$generatio_up & up_concordant == "yes" ~ "UP_yes",
+                  ora_direction == conf$generatio_down & down_concordant == "yes" ~ "DOWN_yes",
+                  TRUE ~ "no"))
+
+        # Plot with a single geom_point and a single color scale
+        p <- plot_data_long %>% ggplot(aes(x = generatio, y = effect_size_wmw_activation_sample_agg, shape = wmw_sig, color = concordance_status)) +
+                                geom_point() +
+                                scale_shape_manual(
+                                        values = c("yes" = 16, "no" = 4)
+                                        ) +
+                                scale_color_manual(
+                                        name   = "Concordance",
+                                        values = c("UP_yes" = "red", "DOWN_yes" = "purple", "no" = "grey"),
+                                        labels = c("UP_yes" = "UP Concordant", "DOWN_yes" = "DOWN Concordant", "no" = "Not Concordant")
+                                        ) +
+                                geom_hline(
+                                        yintercept = 0,
+                                        col = "black",
+                                        linetype = "dashed"
+                                        ) +
+                                geom_vline(
+                                        xintercept = 0,
+                                        col = "black",
+                                        linetype = "dashed"
+                                        ) +
+                                labs(
+                                        title = paste0("Enriched programs in ORA analysis according to ", conf$title," DEGs"),
+                                        shape = "Also significant (FDR < 0.05)\nin WMW analysis"
+                                        ) +
+                                xlab("ORA gene ratio") +
+                                ylab("WMW effect size") +
+                                geom_label_repel(
+                                        data               = plot_data_long %>% filter(!concordance_status == "no" & wmw_sig == "yes"),
+                                        aes(label = paste0("(", cell_type, ")", " ", program_short)),
+                                        size               = 2.5,           
+                                        max.overlaps       = Inf,   
+                                        box.padding        = 0.5,
+                                        point.padding      = 0.2,
+                                        min.segment.length = 0,
+                                        nudge_x            = 0.15,
+                                        nudge_y            = 0.5
+                                        ) +
+                                theme_minimal()
+        ggsave(plot = p,
+               filename = paste0(out_dir,"WMW-ORA/ORA_", name, "_scatter_WMW.pdf"),
+               width = 10,
+               height = 7,
+               device = "pdf",
+               create.dir = TRUE)
+})
+```
+# WMW-LMM
+
+```{r}
+plot_data <- gigatable %>% 
+                dplyr::select(cell_type,
+                              program_short,
+                              FDR_lmm_phase,
+                              FDR_wmw_activation_sample_agg,
+                              log2FC_lmm_phase,
+                              effect_size_wmw_activation_sample_agg) %>% 
+                mutate(concordant_effect = ifelse(sign(log2FC_lmm_phase) == sign(effect_size_wmw_activation_sample_agg), "yes", "no"))
+p1 <- plot_data %>% ggplot(aes(x = -log10(FDR_lmm_phase), y = -log10(FDR_wmw_activation_sample_agg))) +
+                        geom_point(
+                                size = 0.5
+                                ) +
+                        stat_cor(
+                                method = "pearson"
+                                ) +
+                        theme_minimal()
+p2 <- plot_data %>% ggplot(aes(x = log2FC_lmm_phase, y = effect_size_wmw_activation_sample_agg)) +
+                        geom_point(
+                                size = 0.5,
+                                aes(color = concordant_effect),
+                                show.legend = FALSE
+                                ) +
+                        stat_cor(
+                                method = "spearman"
+                                ) +
+                        scale_color_manual(
+                                values = c("yes" = "black", "no" = "grey")
+                                ) +
+                        theme_minimal()
+p <- p1 | p2 
+p <- p + labs(
+        title = "Significance and deregulatory effect correlation between LMM and WMW analyses of Spectra activation scores"
+)
+ggsave(plot = p,
+       filename = paste0(out_dir, "WMW-LMM/sig_eff_corr.pdf"),
+       create.dir = TRUE,
+       device = "pdf",
+       width = 14,
+       height = 7
+)
+```
+
 
 # BIOLOGICAL RELEVANCE
 
-Compute distributions of relevance scores (final_score) from the MAGIC REPORT (cytopus_ipf_full_program_scores.json) between deregulations detected with SPECTRA vs DEA.
 ```{r}
 # Load program scores, used to compute biological relevance
 program_scores_IPF <- read_tsv("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/resources/cytopus_relevance_IPF/cytopus_ipf/cytopus_ipf_full_program_scores.tsv")
+```
 
-DEA_cols  <- colnames(gigatable)[grepl("GSEA", colnames(gigatable)) | grepl("ORA", colnames(gigatable))]
-to_select <- c("cell_type", "program_short")
 
-# Extract celltype-program deregulations detected by SPECTRA, DEA abd both
-programs_spectra <- gigatable %>% 
-                        filter(FDR_lmm_phase < FDR_padj_thresh, abs(log2FC_lmm_phase) > log2FC_lmm_phase_thresh,            # Significant in LMM
-                               if_all(DEA_cols, is.na)) %>%                                                                 # Not significant in any DEA method
-                        dplyr::select(all_of(to_select)) %>% 
-                        unique() %>% 
-                        left_join(program_scores_IPF %>%
-                                        dplyr::select(program_name,
-                                                      final_score),
-                                  by = join_by("program_short" == "program_name")) %>% 
-                        mutate(analysis = "Spectra")
-programs_dea     <- gigatable %>% 
-                        filter(!if_all(DEA_cols, is.na),                                                                    # Significant in at least one DEA method
-                               !(FDR_lmm_phase < FDR_padj_thresh & abs(log2FC_lmm_phase) > log2FC_lmm_phase_thresh)) %>%    # Not significant in LMM
-                        dplyr::select(all_of(to_select)) %>% 
-                        unique() %>% 
-                        left_join(program_scores_IPF %>%
-                                        dplyr::select(program_name,
-                                                      final_score),
-                                  by = join_by("program_short" == "program_name")) %>% 
-                        mutate(analysis = "DEA")
-programs_both    <- gigatable %>% 
-                        filter(!if_all(DEA_cols, is.na),                                                                    # Significant in at least one DEA method
-                               FDR_lmm_phase < FDR_padj_thresh & abs(log2FC_lmm_phase) > log2FC_lmm_phase_thresh) %>%       # Significant in LMM
-                        dplyr::select(all_of(to_select)) %>% 
-                        unique() %>% 
-                        left_join(program_scores_IPF %>%
-                                        dplyr::select(program_name,
-                                                      final_score),
-                                  by = join_by("program_short" == "program_name")) %>% 
-                        mutate(analysis = "Both")
+## ALL ANALYSES
+```{r}
+programs = list(
+                programs_LMM = gigatable %>% 
+                                        filter(FDR_lmm_phase < FDR_padj_thresh,
+                                               abs(log2FC_lmm_phase) > 1) %>%
+                                        dplyr::select(cell_type, program_short) %>% 
+                                        unique() %>% 
+                                        left_join(program_scores_IPF %>% 
+                                                          dplyr::select(program_name,
+                                                                        final_score),
+                                                  by = join_by("program_short"=="program_name")) %>% 
+                                        mutate(analysis = "LMM"),
+                programs_WMW_03 = gigatable %>% 
+                                        filter(FDR_wmw_activation_sample_agg < FDR_padj_thresh,
+                                               abs(effect_size_wmw_activation_sample_agg) > 0.3) %>%
+                                        dplyr::select(cell_type, program_short) %>% 
+                                        unique() %>% 
+                                        left_join(program_scores_IPF %>% 
+                                                          dplyr::select(program_name,
+                                                                        final_score),
+                                                  by = join_by("program_short"=="program_name")) %>% 
+                                        mutate(analysis = "WMW_03"),
+                programs_WMW_05 = gigatable %>% 
+                                        filter(FDR_wmw_activation_sample_agg < FDR_padj_thresh,
+                                               abs(effect_size_wmw_activation_sample_agg) > 0.5) %>%
+                                        dplyr::select(cell_type, program_short) %>% 
+                                        unique() %>% 
+                                        left_join(program_scores_IPF %>% 
+                                                          dplyr::select(program_name,
+                                                                        final_score),
+                                                  by = join_by("program_short"=="program_name")) %>% 
+                                        mutate(analysis = "WMW_05"),
+                programs_GSEA_sc = gigatable %>% 
+                                        filter(padj_GSEA_sc < FDR_padj_thresh) %>%
+                                        dplyr::select(cell_type, program_short) %>% 
+                                        unique() %>% 
+                                        left_join(program_scores_IPF %>% 
+                                                          dplyr::select(program_name,
+                                                                        final_score),
+                                                  by = join_by("program_short"=="program_name")) %>% 
+                                        mutate(analysis = "GSEA_sc"),
+                programs_GSEA_pb = gigatable %>% 
+                                        filter(padj_GSEA_pb < FDR_padj_thresh) %>%
+                                        dplyr::select(cell_type, program_short) %>% 
+                                        unique() %>% 
+                                        left_join(program_scores_IPF %>% 
+                                                          dplyr::select(program_name,
+                                                                        final_score),
+                                                  by = join_by("program_short"=="program_name")) %>% 
+                                        mutate(analysis = "GSEA_pb"),
+                programs_ORA_sc = gigatable %>% 
+                                        filter(padj_ORA_UP_sc < FDR_padj_thresh | padj_ORA_DOWN_sc < FDR_padj_thresh) %>%
+                                        dplyr::select(cell_type, program_short) %>% 
+                                        unique() %>% 
+                                        left_join(program_scores_IPF %>% 
+                                                          dplyr::select(program_name,
+                                                                        final_score),
+                                                  by = join_by("program_short"=="program_name")) %>% 
+                                        mutate(analysis = "ORA_sc"),
+                programs_ORA_pb = gigatable %>% 
+                                        filter(padj_ORA_UP_pb < FDR_padj_thresh | padj_ORA_DOWN_pb < FDR_padj_thresh) %>%
+                                        dplyr::select(cell_type, program_short) %>% 
+                                        unique() %>% 
+                                        left_join(program_scores_IPF %>% 
+                                                          dplyr::select(program_name,
+                                                                        final_score),
+                                                  by = join_by("program_short"=="program_name")) %>% 
+                                        mutate(analysis = "ORA_pb"),
+                programs_ORA_both = gigatable %>% 
+                                        filter(padj_ORA_UP_both < FDR_padj_thresh | padj_ORA_DOWN_both < FDR_padj_thresh) %>%
+                                        dplyr::select(cell_type, program_short) %>% 
+                                        unique() %>% 
+                                        left_join(program_scores_IPF %>% 
+                                                          dplyr::select(program_name,
+                                                                        final_score),
+                                                  by = join_by("program_short"=="program_name")) %>% 
+                                        mutate(analysis = "ORA_both")
+)
+plot_data <- bind_rows(programs)   
 
-plot_data <- bind_rows(list(programs_spectra, programs_dea, programs_both))
+p <- plot_data %>% ggplot(aes(x = final_score, y = analysis, fill = ..x..)) +
+                          geom_density_ridges_gradient(
+                                  scale = 3,
+                                  rel_min_height = 0.01
+                                  ) +
+                          scale_fill_viridis(
+                                  name = "final_score",
+                                  option = "E"
+                                  ) +
+                          labs(
+                                  title = 'Biological relevance scores of deregulated programs in each analysis.') +
+                          theme_minimal() +
+                          theme(
+                                  legend.position="none",
+                                  panel.spacing = unit(0.5, "lines"),
+                                  strip.text.x = element_text(size = 8)
+                                  )
+ggsave(plot       = p,
+       filename   = paste0(out_dir, "biological_relevace/all_analyses_ridge.pdf"),
+       device     = "pdf",
+       width      = 10,
+       height     = 5, 
+       create.dir = TRUE)
 
 p <- plot_data %>% ggplot(aes(x = analysis, y = final_score)) +
-                        geom_boxplot(outliers = FALSE) +      # Not showing outliers since datapoints are shown
-                        geom_jitter() +
-                        ggtitle("Biological relevance in IPF (final_score from cytopus relevance report) in programs found deregulated only by Spectra, only by DEA methods (any) or both.") +
-                        ylab("Relevance score") +
-                        theme_minimal()
-
+                          geom_boxplot(
+                                  outliers = FALSE
+                                  ) +
+                          geom_jitter(
+                                  position = position_jitter(width = 0.1),
+                                  size = 0.5
+                          )+
+                          labs(
+                                  title = 'Biological relevance scores of deregulated programs in each analysis.') +
+                          theme_minimal() +
+                            theme(
+                              legend.position="none",
+                              panel.spacing = unit(0.5, "lines"),
+                              strip.text.x = element_text(size = 8)
+                            )
 ggsave(plot       = p,
-       filename   = "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation/methods_comparison/biological_relevace/SPECTRA_vs_DEA_vs_both.pdf",
+       filename   = paste0(out_dir, "biological_relevace/all_analyses_boxplot.pdf"),
        device     = "pdf",
-       create.dir = TRUE,
        width      = 8,
-       height     = 5)
+       height     = 5, 
+       create.dir = TRUE)
 
+```
+
+
+## PAIRWISE COMPARISONS
+
+Compute pairwise comparison between WMW, LMM, GSEA_sc and GSEA_pb
+
+```{r}
+
+target_analyses <- c("programs_LMM", "programs_WMW_03", "programs_WMW_05", "programs_GSEA_sc", "programs_GSEA_pb")
+
+combinations <- combn(target_analyses, 2, simplify = FALSE)
+
+out_dir <- paste0(out_dir, "biological_relevace/pairwise_comparisons")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+for (combo in combinations) {
+  name1 <- combo[1]
+  name2 <- combo[2]
+  
+  df1 <- programs[[name1]]
+  df2 <- programs[[name2]]
+  
+  # Items unique to the first list
+  unique_df1 <- anti_join(df1, df2, by = c("cell_type", "program_short")) %>%
+    mutate(comparison_group = paste("Unique to\n", str_split_i(name1, "programs_", 2)))
+  
+  # Items unique to the second list
+  unique_df2 <- anti_join(df2, df1, by = c("cell_type", "program_short")) %>%
+    mutate(comparison_group = paste("Unique to\n", str_split_i(name2, "programs_", 2)))
+  
+  intersection_df <- inner_join(
+    df1 %>% dplyr::select(cell_type, program_short, final_score), 
+    df2 %>% dplyr::select(cell_type, program_short), 
+    by = c("cell_type", "program_short")
+  ) %>%
+    mutate(comparison_group = "Intersection")
+  
+  pair_plot_data <- bind_rows(unique_df1, unique_df2, intersection_df)
+  
+  pair_plot_data$comparison_group <- factor(
+    pair_plot_data$comparison_group, 
+    levels = c(paste("Unique to\n", str_split_i(name1, "programs_", 2)), "Intersection", paste("Unique to\n", str_split_i(name2, "programs_", 2)))
+  )
+  
+  p <- pair_plot_data %>% 
+    ggplot(aes(x = comparison_group, y = final_score)) +
+    geom_boxplot(outliers = FALSE) +
+    geom_jitter(
+      position = position_jitter(width = 0.1),
+      size = 0.5
+    ) +
+    labs(
+      title = paste('Biological relevance scores:', str_split_i(name1, "programs_", 2), 'vs', str_split_i(name2, "programs_", 2)),
+      x = NULL,
+      y = "Final Score"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      panel.spacing = unit(0.5, "lines"),
+      strip.text.x = element_text(size = 8)
+    )
+  
+  file_name <- paste0(str_split_i(name1, "programs_", 2), "_", str_split_i(name2, "programs_", 2), "_pairwise_boxplot.pdf")
+  file_path <- file.path(out_dir, file_name)
+  
+  ggsave(plot       = p,
+         filename   = file_path,
+         device     = "pdf",
+         width      = 8,
+         height     = 5)
+}
 ```
 
 

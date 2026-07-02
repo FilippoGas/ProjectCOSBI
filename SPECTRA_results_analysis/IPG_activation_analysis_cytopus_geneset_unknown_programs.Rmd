@@ -1,0 +1,464 @@
+Filippo Gastaldello - 26/01/26
+
+Analysis of the output of SPECTRA
+
+```{r}
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+library(ggpubr)
+library(ggrepel)
+library(parallel)
+library(Seurat)
+library(eulerr)
+library(patchwork)
+library(ggplotify)
+library(jsonlite)
+library(tidyverse)
+library(ggrastr)
+library(msigdbr)
+library(fgsea)
+library(clusterProfiler)  
+library(org.Hs.eg.db)
+library(DOSE)
+library(ReactomePA)
+library(enrichplot)
+library(effectsize)
+```
+
+```{r}
+output_dir <- "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA_results_analysis/full/cytopus_genesets/manual_annotation/unknown_programs/"
+```
+
+
+# Data loading and preprocess
+```{r}
+# Define cell type annotation and gene sets to be used
+annotation <- "manual"
+annotation_column <- "manual_annotation_1"
+
+# Cell scores quantify the activation of each gene program in every cell
+cell_scores <- read_csv("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/manual_annotation/Natri_et_al_full_manual_anno_cell_scores_93908.hpc3-head1.unitn.it.csv") %>% dplyr::rename("cell_id"="...1")
+# Expression metadata are needed to match cell id to their cell type
+metadata <- read_csv("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/Natri_et_al_metadata.csv")
+# Only keep metadata for cells in the SPECTRA output
+metadata <- metadata %>% filter(cell_id %in% cell_scores$cell_id)
+# Add condition column to cell scores
+cell_scores <- cell_scores %>% 
+                        left_join(metadata %>% dplyr::select(cell_id, Diagnosis, Sample_Name, Phase, annotation_column)) %>%
+                        relocate(Diagnosis, .before = cell_id) %>%
+                        relocate(Phase, .after = Diagnosis) %>%
+                        relocate(Sample_Name, .before = Diagnosis) %>% 
+                        relocate(annotation_column, .after=Diagnosis)
+colnames(cell_scores)[3] <- "annotation"
+# only keep programs without a name
+unknown_programs <- grep("\\d+$", colnames(cell_scores)[6:length(colnames(cell_scores))], value = TRUE)
+cell_scores <- cell_scores %>% dplyr::select(all_of(c(colnames(cell_scores)[1:5], unknown_programs)))
+```
+
+# Name unknown programs
+
+## Get factors markers
+```{r}
+markers <- read_csv("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/SPECTRA/full/manual_annotation/Natri_et_al_full_manual_anno_factor_markers_93908.hpc3-head1.unitn.it.csv") %>% dplyr::select(all_of(unknown_programs))
+```
+
+
+## ORA of factors markers
+
+```{r}
+cytopus_gene_sets <- read_json("/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/IPF_datasets/Natri_et_al/cytopus_gene_sets/knowledgebase_gene_sets_manual_annotation.json")
+universe_symbol <- markers %>% 
+                        pivot_longer(everything()) %>% 
+                        pull(value) %>% 
+                        unique()
+
+res <- lapply(unknown_programs, function(factor){
+        
+        cell_type <- str_split_i(factor, "-X-", 2)
+        cell_type <- ifelse(cell_type == "global", "all", cell_type)
+        
+        # Prepare Cytopus term2gene for current cell type (program specificity)
+        if(cell_type=="all") {
+                cytopus_list <- c(cytopus_gene_sets[["global"]])
+        }else{
+                cytopus_list <- c(cytopus_gene_sets[[cell_type]], cytopus_gene_sets[["global"]])
+        }
+        cytopus_list <- lapply(cytopus_list, function(x) as.character(unlist(x, use.names = FALSE)))
+        
+        cytopus_term2gene <- data.frame(
+                term = rep(names(cytopus_list), lengths(cytopus_list)),
+                gene = unlist(cytopus_list, use.names = FALSE)
+        )
+        # Run ORA against Cytopus using factor markers
+        ora_results <- enricher(markers %>% pull(factor),
+                                minGSSize = 5,
+                                universe  = universe_symbol,
+                                TERM2GENE = cytopus_term2gene)
+        
+        if(is.null(ora_results)){ return(data.frame(fact = factor, name = factor)) }
+        
+        ora_results <- ora_results@result %>% 
+                        filter(p.adjust <= 0.05) %>% 
+                        mutate(GeneRatio = as.numeric(str_split_i(GeneRatio, "/",1))/as.numeric(str_split_i(GeneRatio, "/",2))) %>% 
+                        slice_min(GeneRatio) %>% 
+                        pull(ID)
+        
+        ora_results <- ifelse(is_empty(ora_results), str_split_i(factor, "-X-",1), ora_results)                
+        
+        return(data.frame(fact = factor,
+                          name = paste0(str_split_i(factor, "-X-",1),
+                                        "-X-",
+                                        str_split_i(factor, "-X-",2),
+                                        "-X-",
+                                        ora_results)))
+})
+
+factor_names <- bind_rows(res)
+
+colnames(cell_scores)[6:ncol(cell_scores)] <- factor_names$name
+```
+
+# Wilcoxon-Mann-Whitney test (DAP, sample aggregated)
+
+Test IGP activation differences in case vs control for each cell type aggregating score at sample level
+
+```{r}
+res_WMW_sample_agg <- lapply(unique(cell_scores$annotation), function(cell_type){
+        
+        # Subset cell scores to keep only current cell type
+        celltype_cell_score <- cell_scores %>% dplyr::filter(annotation == cell_type)
+        
+        # Store total cells for percentages
+        n_total_control <- sum(celltype_cell_score$Diagnosis == "Control")
+        n_total_ipf     <- sum(celltype_cell_score$Diagnosis == "IPF")
+        
+        tests_list <- list()
+        
+        programs <- colnames(celltype_cell_score)[6:length(colnames(celltype_cell_score))]
+        
+        for (program in programs) {
+        
+                # Extract active cells
+                vec_control <- celltype_cell_score %>% 
+                                        dplyr::filter(Diagnosis == "Control" & .[[program]] > 0.001) %>%
+                                        dplyr::select(all_of(program), Sample_Name)
+                vec_ipf     <- celltype_cell_score %>%
+                                        dplyr::filter(Diagnosis == "IPF" & .[[program]] > 0.001) %>%
+                                        dplyr::select(all_of(program), Sample_Name)
+                
+                n_active_control <- nrow(vec_control)
+                n_active_case    <- nrow(vec_ipf)
+                
+                perc_active_control <- round((n_active_control / n_total_control) * 100, 2)
+                perc_active_case    <- round((n_active_case / n_total_ipf) * 100, 2)
+                
+                # Aggregate cell scores per sample
+                vec_control_agg <- vec_control %>% summarise(.by = Sample_Name, score = mean(.data[[program]]))
+                vec_ipf_agg     <- vec_ipf     %>% summarise(.by = Sample_Name, score = mean(.data[[program]]))
+                
+                # Extract the numeric vectors for the test
+                scores_control <- vec_control_agg %>% pull(score)
+                scores_ipf     <- vec_ipf_agg %>% pull(score)
+                
+                # Try to compute the test
+                test_res <- try(wilcox.test(x          = scores_control,
+                                            y          = scores_ipf,
+                                            conf.int   = TRUE,
+                                            paired     = FALSE),
+                                silent = TRUE)
+                
+                if (inherits(test_res, "try-error") || length(scores_control) == 0 || length(scores_ipf) == 0) {
+                        stat       <- NA
+                        pval       <- NA
+                        es         <- NA
+                        es_ci_low  <- NA
+                        es_ci_high <- NA
+                } else {
+                        stat <- test_res$statistic
+                        pval <- test_res$p.value
+                        
+                        # Compute effect size and 95% CI on the sample-aggregated data
+                        es_res <- effectsize::rank_biserial(x = scores_ipf, 
+                                                            y = scores_control,  # The second group is used as reference by default 
+                                                            ci = 0.95)
+                        
+                        es         <- es_res$r_rank_biserial
+                        es_ci_low  <- es_res$CI_low
+                        es_ci_high <- es_res$CI_high
+                }
+                
+                # Store results
+                tests_list[[program]] <- data.frame(
+                                        cell_type                 = cell_type, 
+                                        program                   = program, 
+                                        active_cells_control_perc = perc_active_control,
+                                        active_cells_case_perc    = perc_active_case, 
+                                        n_active_control          = n_active_control, 
+                                        n_active_case             = n_active_case,
+                                        n_samples_control         = length(scores_control),
+                                        n_samples_case            = length(scores_ipf),
+                                        avg_activation_control    = mean(scores_control),
+                                        avg_activation_case       = mean(scores_ipf),
+                                        statistic                 = stat, 
+                                        p                         = pval,
+                                        effect_size               = es,
+                                        effect_size_CI_lower      = es_ci_low,
+                                        effect_size_CI_upper      = es_ci_high
+                )
+        }
+        return(bind_rows(tests_list))
+})
+
+# Bind all cell types together
+IGP_activation_WMW_sample_agg <- bind_rows(res_WMW_sample_agg)
+
+# Compute FDR and log2FC (Removed manual effect size math)
+IGP_activation_WMW_sample_agg <- IGP_activation_WMW_sample_agg %>%
+  drop_na(p) %>% 
+  group_by(cell_type) %>% 
+  mutate(FDR = p.adjust(p, method = "fdr")) %>% 
+  ungroup() %>% 
+  relocate(FDR, .after = p) %>%
+  mutate(log2FC = log2(avg_activation_case / avg_activation_control))
+if(! dir.exists(paste0(output_dir, "wilcoxon_test_sample_aggregated/"))){dir.create(paste0(output_dir, "wilcoxon_test_sample_aggregated/"), recursive = TRUE)}
+write_csv(IGP_activation_WMW_sample_agg, file = paste0(output_dir, "wilcoxon_test_sample_aggregated/IGP_activation_WMW_test_sample_aggregated.csv"))
+```
+
+## Boxplots - facet
+
+Plot activation values in case vs control, only in comparisons where the difference is significant
+
+```{r}
+# Extract significant tests
+WMW_sample_agg_sig <- IGP_activation_WMW_sample_agg %>% dplyr::filter(FDR <0.05 & (abs(effect_size) > 0.3))
+
+plot_data <- cell_scores %>%
+                pivot_longer(6:length(colnames(cell_scores)), names_to = "program") %>%                           # Flatten cell_scores for plotting
+                filter(value > 0.001) %>%                                                                         # Only keep active cells
+                group_by(Sample_Name, annotation, program, Diagnosis) %>% 
+                summarize(value = mean(value)) %>%                                                                # Aggregate activation score per sample, for each cell type
+                ungroup() %>% 
+                inner_join(WMW_sample_agg_sig %>%                                                                 # Only keep significant de-regulations
+                                   dplyr::select(cell_type, program, FDR),
+                           by = join_by("annotation" == "cell_type", "program" == "program"))
+
+p <- plot_data %>% ggplot(aes(x=program, y=value, fill=Diagnosis))+
+                geom_boxplot() +
+                theme_minimal() +
+                theme(
+                        axis.text.x = element_text(hjust=1, angle = 45, size = 5)
+                ) +
+                facet_wrap(~annotation, scale="free")
+
+ggsave(filename = paste0(output_dir, "wilcoxon_test_sample_aggregated/boxplots_DAP/boxplot_wilcoxon_significant_facet_celltype.pdf"), plot = p, device = "pdf", width = 18, height = 15, create.dir = TRUE)
+```
+## Boxplot - per celltype
+
+```{r}
+for (celltype in unique(plot_data$annotation)) {
+        
+        p <- plot_data %>%
+                dplyr::filter(annotation==celltype) %>%
+                ggplot(aes(x=program, y=value, fill=Diagnosis)) +
+                        geom_boxplot(
+                                outliers = FALSE
+                        ) +
+                        geom_jitter(
+                                position = position_jitterdodge(),
+                                alpha    = 0.5,
+                                size     = 0.7
+                                ) +
+                        labs(
+                                title = paste0("IGP with significant differences in activation between case and control in ",celltype," cells."),
+                                y = "Activation level"
+                                ) +
+                        stat_compare_means(
+                                aes(group = Diagnosis),
+                                method = "wilcox.test",
+                                method.args = list(paired=FALSE),
+                                vjust = -1,
+                                label = "p.signif"
+                                ) +
+                        stat_summary(
+                            fun.data = function(y) {
+                              return(data.frame(
+                                y = max(y),
+                                label = paste0("n= ",length(y))
+                              ))
+                            },
+                            geom = "text",
+                            position = position_dodge(width = 0.75),
+                            vjust = -0.5,
+                            size = 3
+                          ) +
+                        theme_minimal() +
+                        theme(
+                                axis.text.x = element_text(hjust=1, angle=45, size=8)
+                                )
+        
+        ggsave(filename = paste0(output_dir, "wilcoxon_test_sample_aggregated/boxplots_DAP/boxplot_wilcoxon_significant_", gsub("/", "_", celltype),".pdf"),
+               plot = p,
+               device = "pdf",
+               width = 12,
+               height = 8,
+               create.dir = TRUE)
+}
+```
+
+## Volcano plot FDR vs effect size
+```{r}
+plot_data <- IGP_activation_WMW_sample_agg %>% 
+                mutate(label = paste0("(", cell_type, ") ", str_split_i(program, "-X-", 3)),
+                       sig = case_when(
+                               FDR <= 0.05 & effect_size >= 0.5                      ~ "up_high",
+                               FDR <= 0.05 & effect_size >=0.3 & effect_size < 0.5   ~ "up_mid",
+                               FDR <= 0.05 & effect_size <= -0.5                     ~ "down_high",
+                               FDR <= 0.05 & effect_size <= -0.3 & effect_size> -0.5 ~ "down_mid",
+                               TRUE                                                  ~ "no_sig"
+                       )) %>%
+                dplyr::select(label,
+                              FDR,
+                              effect_size,
+                              sig)
+
+p <- plot_data %>% ggplot(aes(x = effect_size, y = -log10(FDR), color = sig)) +
+                        geom_point() +
+                        scale_color_manual(
+                                values = c("up_high" = "#f00514", "up_mid" = "#d19f9f", "down_high" = "#6e02e0", "down_mid" = "#b6a9c9", "no_sig" = "#d4d4d4"),
+                                breaks = c("down_high", "down_mid", "up_high", "up_mid"),
+                                labels = c("Over activated - High confidence", "Over activated - Moderate confidence","Repressed - High confidence", "Repressed - Moderate confidence")
+                                )  +
+                        geom_label_repel(
+                                data = plot_data %>% filter(sig == "up_high" | sig == "down_high"),
+                                aes(label = label),
+                                size = 2.5,           
+                                max.overlaps = Inf,   
+                                box.padding = 0.5,
+                                point.padding = 0.2,
+                                min.segment.length = 0,
+                                nudge_x = .15,
+                                nudge_y = .5,
+                                ) +
+                        labs(
+                                title    = "Deregulated programs activations according to Spectra scores",
+                                subtitle = "Wilcoxon unpaired test on sample aggregated scores per cell type.",
+                                color    = "Deregulation effect"
+                                ) +
+                        theme_minimal()
+ggsave(plot = p,
+       filename = paste0(output_dir, "wilcoxon_test_sample_aggregated/volcano_FDR_effect_size.pdf"),
+       create.dir = TRUE,
+       height = 9,
+       width = 13,
+       device = "pdf")
+```
+
+# Linear Mixed Model - cell cycle phase correction (DAP)
+
+```{r message=FALSE, warning=FALSE}
+res_lmm <- lapply(unique(cell_scores$annotation),
+                function(cell_type){
+                        # Subset cell scores to keep only current cell type
+                        celltype_cell_score <- cell_scores %>% dplyr::filter(annotation == cell_type)
+                        # Prepare dataset to store Welch's test results
+                        tests <- data_frame("cell_type"=character(), "program"=character(), "term"=character(), "active_cells_control_perc"=numeric(), "active_cells_case_perc"=numeric(), "avg_control_activation"=numeric(), "avg_case_activation"= numeric(), "estimate"=numeric(),
+                                            "std.err"=numeric(), "statistic"=numeric(), "p"=numeric())
+                        # For each program, test for difference in activation between case and control, only in active cells (activation > 0.001) as per Authors suggestion
+                        for (program in colnames(celltype_cell_score)[6:length(colnames(celltype_cell_score))]) {
+                                # Compute number of active cells (activation > 0.001) in this cell type
+                                perc_active_cells_control <- round((celltype_cell_score %>%
+                                                                        dplyr::filter(Diagnosis == "Control" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                perc_active_cells_case <-    round((celltype_cell_score %>%
+                                                                        dplyr::filter(Diagnosis == "IPF" & .[[program]]>0.001) %>%
+                                                                        rownames() %>%
+                                                                        length())/length(rownames(celltype_cell_score))*100,
+                                                                   2)
+                                # Compute average activation in case vs control
+                                avg_control_activation <- celltype_cell_score %>%
+                                                                dplyr::filter(Diagnosis == "Control") %>% 
+                                                                pull(any_of(program)) %>% 
+                                                                mean()
+                                avg_case_activation <- celltype_cell_score %>%
+                                                                dplyr::filter(Diagnosis == "IPF") %>% 
+                                                                pull(any_of(program)) %>% 
+                                                                mean()
+                                # Try to compute the test, it might fail if not enough cells are active
+                                data <- celltype_cell_score %>% dplyr::select(Diagnosis, Sample_Name, Phase, all_of(program)) %>% dplyr::filter(.[[program]]>0.001)
+                                colnames(data) <- c("Diagnosis", "Sample_Name", "Phase", "Program")
+                                test_res <- try(lmer(Program ~ Diagnosis + Phase + (1|Sample_Name), data = data),
+                                                silent = TRUE)
+                                if (inherits(test_res, "try-error")) {
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, term = NA, "active_cells_control_perc"=perc_active_cells_control,
+                                                                  "active_cells_case_perc"=perc_active_cells_case, "avg_control_activation"=avg_control_activation,
+                                                                  "avg_case_activation"=avg_case_activation, "estimate"=NA, "std.err"=NA, "statistic"=NA, "p"=NA)
+                                                       )
+                                }else{
+                                        test_res <- tidy(test_res, effects = "fixed")[2:3,]
+                                        tests <- rbind(tests,
+                                                       data_frame("cell_type"=cell_type, "program"=program, "term"=test_res$term,
+                                                                  "active_cells_control_perc"=perc_active_cells_control, "active_cells_case_perc"=perc_active_cells_case,
+                                                                  "avg_control_activation"=avg_control_activation, "avg_case_activation"=avg_case_activation,
+                                                                  "estimate"=test_res$estimate, "std.err"=test_res$std.error, "statistic"=test_res$statistic, "p"=test_res$p.value)
+                                                       )
+                                }
+                        }
+                        return(tests)
+                }
+        )
+IGP_activation_lmm_phase_corrected <- bind_rows(res_lmm)
+IGP_activation_lmm_phase_corrected <- IGP_activation_lmm_phase_corrected %>% 
+                        drop_na() %>% 
+                        group_by(cell_type) %>% 
+                        mutate(FDR = p.adjust(p, method = "fdr")) %>% 
+                        ungroup()
+# Compute effect size as activationFC log2((avg_control_activation + estimate)/avg_case_activation)
+IGP_activation_lmm_phase_corrected <- IGP_activation_lmm_phase_corrected %>% mutate(log2FC = log2((avg_control_activation+estimate)/avg_control_activation))
+
+if(! dir.exists(paste0(output_dir, "lmm/"))){dir.create(paste0(output_dir, "lmm/"), recursive = TRUE)}
+write_csv(IGP_activation_lmm_phase_corrected, file = paste0(output_dir, "lmm/IPG_activation_lmm_phase_corrected.csv"))
+```
+
+## Volcano plot
+```{r}
+# create tag for labels and deregulation column
+FC_thresh <- 1
+FDR_thresh <- 0.05
+
+plot_data <- IGP_activation_lmm_phase_corrected %>%
+                dplyr::filter(!log2FC=="NaN",
+                       !str_detect(term, "Phase")) %>% 
+                mutate(tag = paste0(cell_type, "-", str_split_i(program, "-X-",3)),
+                       diff_activated = ifelse(FDR<FDR_thresh & log2FC>FC_thresh, "UP", "NO"),
+                       diff_activated = ifelse(FDR<FDR_thresh & log2FC< -FC_thresh, "DOWN", diff_activated))
+
+p <- plot_data %>% ggplot(aes(x=log2FC, y=-log10(FDR), color = diff_activated)) +
+                geom_point(size = 1) +
+                scale_color_manual(values = c("red", "grey", "purple"),
+                                   labels = c("Downactivated", "Not significant", "Overactivated")) +
+                geom_vline(xintercept = c(-1, 1), col = 'grey', linetype = 'dashed') +
+                geom_hline(yintercept = -log10(0.05), col = 'grey', linetype = 'dashed')  +
+                        geom_label_repel(
+                                data = plot_data %>% filter(diff_activated == "UP" | diff_activated == "DOWN"),
+                                aes(label = tag),
+                                size = 2.5,           
+                                max.overlaps = Inf,   
+                                box.padding = 0.5,
+                                point.padding = 0.2,
+                                min.segment.length = 0,
+                                nudge_x = .15,
+                                nudge_y = .5,
+                                ) +
+                labs(
+                        title = "Linear Mixed Model - Sample ID as random effect, correcting for cell cycle phase",
+                        subtitle = "comparison between activation in case vs control, for each program in each cell type",
+                        x = "log2(activation FC)"
+                        )+
+                theme_minimal()
+
+ggsave(filename = paste0(output_dir, "/lmm/volcano_lmm_phase_corrected.pdf"), plot = p, device = "pdf", width = 10, height = 10, create.dir = TRUE)
+```
