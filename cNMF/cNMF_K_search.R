@@ -24,7 +24,7 @@ factorize_folder <- "/shares/CIBIO-Storage/BCG/scratch/fgastaldello/COSBI/data/I
 sc_dataset <- read_rds(sc_dataset_path)
 
 # Extract count matrix
-counts     <- sc_dataset@assays$RNA$counts
+counts     <- sc_dataset@assay$RNA$counts
 barcodes   <- colnames(counts)
 gene_names <- rownames(counts)
 
@@ -44,7 +44,7 @@ cmd = paste("cnmf prepare",
             "   --output-dir", prepare_folder,
             "   --name", run_name,
             "   -c", paste0(mtx_folder, "matrix.mtx"),
-            "   --max-nmf-iter 1000",
+            "   --man-nmf-iter 1000",
             "   -k", paste(seq(20,210,10), collapse=" "),
             "   --n-iter 20",
             sep = " ")
